@@ -16,7 +16,10 @@ import (
 )
 
 func setupSignalClient(t *testing.T) *sse.Client {
-	server := sse.NewServer()
+	server, err := sse.NewServer()
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
 	ts := httptest.NewServer(server)
 	t.Cleanup(ts.Close)
 
@@ -33,7 +36,7 @@ func TestBasicConn(t *testing.T) {
 	ctx := t.Context()
 
 	pipe.SetStatusFunc(func(c *pipe.Conn, status webrtc.PeerConnectionState) {
-		slog.Info("peer connection state changed", "id", c.ID(), "status", status)
+		slog.InfoContext(ctx, "peer connection state changed", "id", c.ID(), "status", status)
 	})
 
 	data := strings.Repeat("Hello World", 1000)

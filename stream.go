@@ -14,6 +14,8 @@ const (
 	defaultDataChannelChunkSize = 16 * 1024
 	dataChannelDrainTimeout     = 5 * time.Second
 	dataChannelDrainInterval    = 10 * time.Millisecond
+	dataChannelWriteTimeout     = 15 * time.Second
+	dataChannelHighWatermark    = 512 * 1024
 )
 
 // dataChannelStream adapts a WebRTC data channel to behave like an io.ReadWriteCloser.
@@ -81,6 +83,13 @@ func (s *dataChannelStream) Write(p []byte) (int, error) {
 			chunk = s.chunkSize
 		}
 
+		if err := s.waitForWritable(); err != nil {
+			if total > 0 {
+				return total, err
+			}
+			return 0, err
+		}
+
 		if err := s.dc.Send(remaining[:chunk]); err != nil {
 			if total > 0 {
 				return total, err
@@ -122,6 +131,13 @@ func (s *dataChannelStream) CloseWithError(err error) {
 	}
 }
 
+// Sync blocks until all buffered data has been transmitted to the network layer.
+// Note: This only guarantees the data left the local buffer, not that the remote
+// peer received it. For end-to-end confirmation, use application-level acknowledgment.
+func (s *dataChannelStream) Sync(ctx context.Context) error {
+	return s.waitForDrain(ctx)
+}
+
 func (s *dataChannelStream) waitForDrain(ctx context.Context) error {
 	if s.dc == nil {
 		return nil
@@ -144,6 +160,35 @@ func (s *dataChannelStream) waitForDrain(ctx context.Context) error {
 		case <-ticker.C:
 		case <-ctx.Done():
 			return ctx.Err()
+		}
+	}
+}
+
+func (s *dataChannelStream) waitForWritable() error {
+	if s.dc == nil {
+		return io.ErrClosedPipe
+	}
+
+	timer := time.NewTimer(dataChannelWriteTimeout)
+	defer timer.Stop()
+
+	ticker := time.NewTicker(dataChannelDrainInterval)
+	defer ticker.Stop()
+
+	for {
+		state := s.dc.ReadyState()
+		if state != webrtc.DataChannelStateOpen && state != webrtc.DataChannelStateClosing {
+			return io.ErrClosedPipe
+		}
+
+		if s.dc.BufferedAmount() <= dataChannelHighWatermark {
+			return nil
+		}
+
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			return context.DeadlineExceeded
 		}
 	}
 }
