@@ -241,53 +241,57 @@ func (c *Client) Receiver(inbox *signal.Inbox) (signal.Receiver, error) {
 
 	return &clientReceiver{
 		receive: func(ctx context.Context) (*signal.Msg, error) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
+			for {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+
+				// reset the sigMsg
+				sigMsg.Type = 0
+				if sigMsg.Body != nil {
+					sigMsg.Body = sigMsg.Body[:0]
+				}
+
+				type recvResult struct {
+					msg *sse.Message
+					err error
+				}
+
+				resultCh := make(chan recvResult, 1)
+				go func() {
+					msg, err := receiver.Receive()
+					resultCh <- recvResult{msg: msg, err: err}
+				}()
+
+				var msg *sse.Message
+				select {
+				case <-ctx.Done():
+					_ = receiver.Close()
+					return nil, ctx.Err()
+				case result := <-resultCh:
+					msg = result.msg
+					err = result.err
+				}
+
+				if err != nil {
+					return nil, err
+				}
+
+				// Skip non-JSON messages such as SSE keepalive pings (e.g. ": ping").
+				// These are server-side heartbeats and are not valid signal messages.
+				if err := json.Unmarshal([]byte(msg.Data), &sigMsg); err != nil {
+					continue
+				}
+
+				// Type 0 messages are now passed through to the caller
+				// If unknownMsgFn is set, it's called but the message is still returned
+				if sigMsg.Type == 0 && c.unknownMsgFn != nil {
+					c.unknownMsgFn(&sigMsg)
+				}
+
+				// Return all messages including type 0
+				return &sigMsg, nil
 			}
-
-			// reset the sigMsg
-			sigMsg.Type = 0
-			if sigMsg.Body != nil {
-				sigMsg.Body = sigMsg.Body[:0]
-			}
-
-			type recvResult struct {
-				msg *sse.Message
-				err error
-			}
-
-			resultCh := make(chan recvResult, 1)
-			go func() {
-				msg, err := receiver.Receive()
-				resultCh <- recvResult{msg: msg, err: err}
-			}()
-
-			var msg *sse.Message
-			select {
-			case <-ctx.Done():
-				_ = receiver.Close()
-				return nil, ctx.Err()
-			case result := <-resultCh:
-				msg = result.msg
-				err = result.err
-			}
-
-			if err != nil {
-				return nil, err
-			}
-
-			if err := json.Unmarshal([]byte(msg.Data), &sigMsg); err != nil {
-				return nil, err
-			}
-
-			// Type 0 messages are now passed through to the caller
-			// If unknownMsgFn is set, it's called but the message is still returned
-			if sigMsg.Type == 0 && c.unknownMsgFn != nil {
-				c.unknownMsgFn(&sigMsg)
-			}
-
-			// Return all messages including type 0
-			return &sigMsg, nil
 		},
 		close: receiver.Close,
 	}, nil
