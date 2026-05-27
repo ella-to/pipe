@@ -34,4 +34,4 @@ require (
 	golang.org/x/time v0.14.0 // indirect
 )
 
-replace github.com/pion/webrtc/v4 => github.com/alinz/webrtc/v4 v4.0.0-20260526155930-be95c4c4b79a
+replace github.com/pion/webrtc/v4 => github.com/alinz/webrtc/v4 v4.0.0-20260527142736-ffaad8c148a3
