@@ -45,7 +45,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer pusher.Close()
 
-		msgCh := s.mapper.Get(inbox.String())
+		msgCh := s.mapper.Subscribe(inbox.String())
+		defer s.mapper.Unsubscribe(inbox.String(), msgCh)
 		var msgCount int64
 
 		for {
@@ -237,19 +238,11 @@ func (c *Client) Receiver(inbox *signal.Inbox) (signal.Receiver, error) {
 		return nil, err
 	}
 
-	var sigMsg signal.Msg
-
 	return &clientReceiver{
 		receive: func(ctx context.Context) (*signal.Msg, error) {
 			for {
 				if err := ctx.Err(); err != nil {
 					return nil, err
-				}
-
-				// reset the sigMsg
-				sigMsg.Type = 0
-				if sigMsg.Body != nil {
-					sigMsg.Body = sigMsg.Body[:0]
 				}
 
 				type recvResult struct {
@@ -279,18 +272,21 @@ func (c *Client) Receiver(inbox *signal.Inbox) (signal.Receiver, error) {
 
 				// Skip non-JSON messages such as SSE keepalive pings (e.g. ": ping").
 				// These are server-side heartbeats and are not valid signal messages.
-				if err := json.Unmarshal([]byte(msg.Data), &sigMsg); err != nil {
+				// A fresh Msg is allocated per message: the previous one may
+				// still be retained by the caller.
+				sigMsg := &signal.Msg{}
+				if err := json.Unmarshal([]byte(msg.Data), sigMsg); err != nil {
 					continue
 				}
 
 				// Type 0 messages are now passed through to the caller
 				// If unknownMsgFn is set, it's called but the message is still returned
 				if sigMsg.Type == 0 && c.unknownMsgFn != nil {
-					c.unknownMsgFn(&sigMsg)
+					c.unknownMsgFn(sigMsg)
 				}
 
 				// Return all messages including type 0
-				return &sigMsg, nil
+				return sigMsg, nil
 			}
 		},
 		close: receiver.Close,

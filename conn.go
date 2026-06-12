@@ -120,9 +120,10 @@ type Conn struct {
 	pendingCandidates []webrtc.ICECandidateInit
 
 	// multiplexing support
-	isDialer  bool          // true if created via Dial, false if via Listen
-	sessionMu sync.Mutex    // guards session creation
-	session   *smux.Session // lazily created on first Stream() call
+	isDialer      bool          // true if created via Dial, false if via Listen
+	sessionMu     sync.Mutex    // guards session creation
+	session       *smux.Session // lazily created on first Stream() call
+	sessionActive atomic.Bool   // set once session is created; checked by Read/Write
 }
 
 var _ io.ReadWriteCloser = (*Conn)(nil)
@@ -169,10 +170,7 @@ func (c *Conn) WaitClosed(ctx context.Context) error {
 }
 
 func (c *Conn) Read(p []byte) (n int, err error) {
-	c.sessionMu.Lock()
-	hasSession := c.session != nil
-	c.sessionMu.Unlock()
-	if hasSession {
+	if c.sessionActive.Load() {
 		return 0, ErrMultiplexingActive
 	}
 	raw := c.getRaw()
@@ -183,10 +181,7 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 }
 
 func (c *Conn) Write(p []byte) (n int, err error) {
-	c.sessionMu.Lock()
-	hasSession := c.session != nil
-	c.sessionMu.Unlock()
-	if hasSession {
+	if c.sessionActive.Load() {
 		return 0, ErrMultiplexingActive
 	}
 	raw := c.getRaw()
@@ -384,6 +379,7 @@ func (c *Conn) getOrCreateSession() (*smux.Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.sessionActive.Store(true)
 
 	return c.session, nil
 }
@@ -676,7 +672,7 @@ func (c *Conn) addICECandidate(candidate webrtc.ICECandidateInit) error {
 		return errors.New("peer connection is nil")
 	}
 
-	if c.pc.CurrentRemoteDescription() == nil {
+	if c.pc.RemoteDescription() == nil {
 		c.pendingCandidates = append(c.pendingCandidates, candidate)
 		return nil
 	}
@@ -916,10 +912,13 @@ func CreateListenerWithOptions(id string, sig signal.Signal, opts *WebRTCOptions
 			return nil, err
 		}
 
-		go func() {
-			<-ctx.Done()
+		// Reset the shared receiver when the context is canceled so that an
+		// in-flight receiveMsg unblocks. AfterFunc avoids parking a goroutine
+		// per Listen call, which previously accumulated one stack per
+		// accepted connection under a long-lived context.
+		context.AfterFunc(ctx, func() {
 			resetReceiver(true)
-		}()
+		})
 
 		var serverProvidedConnID string
 

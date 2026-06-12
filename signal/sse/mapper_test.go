@@ -80,3 +80,58 @@ func TestMapperDeleteCreatesNewChannel(t *testing.T) {
 		t.Fatal("expected new channel instance after delete")
 	}
 }
+
+func TestMapperUnsubscribeRemovesIdleEntry(t *testing.T) {
+	m := sse.NewMapper()
+	inbox := "subscriber"
+
+	ch := m.Subscribe(inbox)
+	if m.Len() != 1 {
+		t.Fatalf("expected 1 entry after subscribe, got %d", m.Len())
+	}
+
+	m.Unsubscribe(inbox, ch)
+	if m.Len() != 0 {
+		t.Fatalf("expected entry to be removed after last unsubscribe, got %d", m.Len())
+	}
+}
+
+func TestMapperUnsubscribeKeepsBufferedEntry(t *testing.T) {
+	m := sse.NewMapper()
+	inbox := "buffered"
+
+	ch := m.Subscribe(inbox)
+	ch <- &signal.Msg{}
+
+	m.Unsubscribe(inbox, ch)
+	if m.Len() != 1 {
+		t.Fatalf("expected buffered entry to be kept for redelivery, got %d", m.Len())
+	}
+
+	// A new subscriber must observe the same channel and drain the message.
+	ch2 := m.Subscribe(inbox)
+	if ch2 != ch {
+		t.Fatal("expected same channel for buffered inbox")
+	}
+	select {
+	case <-ch2:
+	default:
+		t.Fatal("expected buffered message")
+	}
+}
+
+func TestMapperUnsubscribeWithConcurrentResubscribe(t *testing.T) {
+	m := sse.NewMapper()
+	inbox := "reconnect"
+
+	ch1 := m.Subscribe(inbox)
+	ch2 := m.Subscribe(inbox) // new connection attaches before old detaches
+	m.Unsubscribe(inbox, ch1)
+
+	if m.Len() != 1 {
+		t.Fatalf("expected entry to survive while a subscriber remains, got %d", m.Len())
+	}
+	if ch1 != ch2 {
+		t.Fatal("expected shared channel")
+	}
+}

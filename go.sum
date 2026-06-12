@@ -1,5 +1,5 @@
-ella.to/sse v0.2.0 h1:Sf+f2bLyLA0oFmH0GibKcQm5vVFcB3EJfTXLCo71hq8=
-ella.to/sse v0.2.0/go.mod h1:Vdy0/OQ4gqAF9HAV7o6teigsVFMWxSl2LJnMx7leWEE=
+ella.to/sse v0.2.4 h1:qPYFr0quWFsFfz3m6SKZ7bV9KxZTpjLwFlxoTAOgsxU=
+ella.to/sse v0.2.4/go.mod h1:CTAt4Hz0p+YlN3SVvn9MwNeNqxgKO+ytHHhaTT1zi7A=
 github.com/alinz/webrtc/v4 v4.0.0-20260527142736-ffaad8c148a3 h1:NLpovCn1nUzOa2oz0AFmRDU15ZKQKURwflhINsy8W1I=
 github.com/alinz/webrtc/v4 v4.0.0-20260527142736-ffaad8c148a3/go.mod h1:/l7Ags53B/mocZXrO3AH+t+tb6cGawKMErVu5DBaEUo=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=

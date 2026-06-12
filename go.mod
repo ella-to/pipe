@@ -3,7 +3,7 @@ module ella.to/pipe
 go 1.25.0
 
 require (
-	ella.to/sse v0.2.0
+	ella.to/sse v0.2.4
 	github.com/pion/turn/v4 v4.1.4
 	github.com/pion/webrtc/v4 v4.2.12
 	github.com/rs/xid v1.6.0

@@ -11,56 +11,165 @@ import (
 )
 
 const (
-	defaultDataChannelChunkSize = 16 * 1024
+	// Outbound writes are split into chunks of at most this size. 64 KiB is
+	// the safe ceiling from RFC 8831 when the peer announces no
+	// max-message-size, and matches what pion itself announces.
+	defaultDataChannelChunkSize = 64 * 1024
 	dataChannelDrainTimeout     = 5 * time.Second
 	dataChannelDrainInterval    = 10 * time.Millisecond
 	dataChannelWriteTimeout     = 15 * time.Second
-	dataChannelHighWatermark    = 512 * 1024
+	// Writes pause once this much data is queued in the SCTP send buffer and
+	// resume when it drains below dataChannelLowWatermark. The gap between the
+	// two provides hysteresis so the writer is not woken for every message.
+	dataChannelHighWatermark = 1024 * 1024
+	dataChannelLowWatermark  = 512 * 1024
+	// Bound on inbound data buffered between the data channel and Read calls.
+	// When full, message delivery blocks, which propagates backpressure to the
+	// sender through SCTP flow control.
+	dataChannelRecvBufferSize = 1024 * 1024
 )
 
-// dataChannelStream adapts a WebRTC data channel to behave like an io.ReadWriteCloser.
-// It converts the message-oriented semantics of the data channel into a streaming
-// reader by using an in-memory pipe.
+// recvBuffer is a bounded FIFO of inbound message payloads. It takes
+// ownership of pushed slices (the data channel allocates a fresh slice per
+// message), so the read path adds no extra copy beyond Read itself.
+type recvBuffer struct {
+	mu       sync.Mutex
+	readable sync.Cond
+	writable sync.Cond
+	queue    [][]byte
+	offset   int // read offset into queue[0]
+	size     int // total unread bytes
+	maxSize  int
+	err      error // sticky; reads drain buffered data first, then return it
+}
+
+func newRecvBuffer(maxSize int) *recvBuffer {
+	b := &recvBuffer{maxSize: maxSize}
+	b.readable.L = &b.mu
+	b.writable.L = &b.mu
+	return b
+}
+
+// push appends p to the buffer, taking ownership of it. It blocks while the
+// buffer is full and returns the sticky error once the buffer is closed.
+func (b *recvBuffer) push(p []byte) error {
+	if len(p) == 0 {
+		return nil
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for b.size >= b.maxSize && b.err == nil {
+		b.writable.Wait()
+	}
+	if b.err != nil {
+		return b.err
+	}
+
+	b.queue = append(b.queue, p)
+	b.size += len(p)
+	b.readable.Signal()
+	return nil
+}
+
+func (b *recvBuffer) read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for b.size == 0 {
+		if b.err != nil {
+			return 0, b.err
+		}
+		b.readable.Wait()
+	}
+
+	n := 0
+	for n < len(p) && len(b.queue) > 0 {
+		head := b.queue[0][b.offset:]
+		c := copy(p[n:], head)
+		n += c
+		if c == len(head) {
+			b.queue[0] = nil
+			b.queue = b.queue[1:]
+			b.offset = 0
+		} else {
+			b.offset += c
+		}
+	}
+	b.size -= n
+	b.writable.Broadcast()
+	return n, nil
+}
+
+// closeWithError sets the sticky error (first caller wins) and wakes all
+// waiting readers and writers.
+func (b *recvBuffer) closeWithError(err error) {
+	b.mu.Lock()
+	if b.err == nil {
+		b.err = err
+	}
+	b.mu.Unlock()
+	b.readable.Broadcast()
+	b.writable.Broadcast()
+}
+
+// dataChannelStream adapts a WebRTC data channel to behave like an
+// io.ReadWriteCloser. Inbound messages are queued in a bounded buffer so the
+// data channel's read loop is only blocked when the application falls more
+// than dataChannelRecvBufferSize behind. Outbound writes are paced by the
+// SCTP buffered amount using OnBufferedAmountLow signaling.
 type dataChannelStream struct {
 	dc        *webrtc.DataChannel
-	reader    *io.PipeReader
-	writer    *io.PipeWriter
+	rb        *recvBuffer
 	writeMu   sync.Mutex
 	closeOnce sync.Once
 
-	// pipeClosed ensures we only tear down the pipe once, either due to Close
-	// or CloseWithError triggered from the remote side.
+	// pipeClosed ensures we only tear down the stream once, either due to
+	// Close or CloseWithError triggered from the remote side.
 	pipeClosed atomic.Bool
+	// closed is closed alongside pipeClosed to unblock pending writers.
+	closed chan struct{}
+	// writable receives a token whenever the SCTP send buffer drains below
+	// dataChannelLowWatermark.
+	writable chan struct{}
 
 	chunkSize int
 }
 
 func newDataChannelStream(dc *webrtc.DataChannel) *dataChannelStream {
-	pr, pw := io.Pipe()
-
 	stream := &dataChannelStream{
 		dc:        dc,
-		reader:    pr,
-		writer:    pw,
+		rb:        newRecvBuffer(dataChannelRecvBufferSize),
+		closed:    make(chan struct{}),
+		writable:  make(chan struct{}, 1),
 		chunkSize: defaultDataChannelChunkSize,
 	}
 
+	dc.SetBufferedAmountLowThreshold(dataChannelLowWatermark)
+	dc.OnBufferedAmountLow(func() {
+		select {
+		case stream.writable <- struct{}{}:
+		default:
+		}
+	})
+
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if len(msg.Data) == 0 {
-			return
-		}
-		if _, err := pw.Write(msg.Data); err != nil {
-			// If the reader side has been closed, propagate the error so that
-			// subsequent reads observe it and stop the goroutine from blocking.
-			stream.CloseWithError(err)
-		}
+		// msg.Data is freshly allocated per message by the data channel, so
+		// the buffer can take ownership of it. push only fails once the
+		// stream is closed, at which point the data is discarded.
+		_ = stream.rb.push(msg.Data)
 	})
 
 	return stream
 }
 
 func (s *dataChannelStream) Read(p []byte) (int, error) {
-	return s.reader.Read(p)
+	return s.rb.read(p)
 }
 
 func (s *dataChannelStream) Write(p []byte) (int, error) {
@@ -76,29 +185,18 @@ func (s *dataChannelStream) Write(p []byte) (int, error) {
 	defer s.writeMu.Unlock()
 
 	total := 0
-	remaining := p
-	for len(remaining) > 0 {
-		chunk := len(remaining)
-		if chunk > s.chunkSize {
-			chunk = s.chunkSize
-		}
+	for total < len(p) {
+		chunk := min(len(p)-total, s.chunkSize)
 
 		if err := s.waitForWritable(); err != nil {
-			if total > 0 {
-				return total, err
-			}
-			return 0, err
+			return total, err
 		}
 
-		if err := s.dc.Send(remaining[:chunk]); err != nil {
-			if total > 0 {
-				return total, err
-			}
-			return 0, err
+		if err := s.dc.Send(p[total : total+chunk]); err != nil {
+			return total, err
 		}
 
 		total += chunk
-		remaining = remaining[chunk:]
 	}
 
 	return total, nil
@@ -113,7 +211,7 @@ func (s *dataChannelStream) Close() error {
 		ctx, cancel := context.WithTimeout(context.Background(), dataChannelDrainTimeout)
 		defer cancel()
 
-		if err := s.waitForDrain(ctx); err != nil && closeErr == nil {
+		if err := s.waitForDrain(ctx); err != nil {
 			closeErr = err
 		}
 
@@ -127,7 +225,8 @@ func (s *dataChannelStream) Close() error {
 
 func (s *dataChannelStream) CloseWithError(err error) {
 	if !s.pipeClosed.Swap(true) {
-		s.writer.CloseWithError(err)
+		close(s.closed)
+		s.rb.closeWithError(err)
 	}
 }
 
@@ -164,16 +263,25 @@ func (s *dataChannelStream) waitForDrain(ctx context.Context) error {
 	}
 }
 
+// waitForWritable returns once the SCTP send buffer has room for another
+// chunk. The fast path is a single atomic load; the slow path waits for the
+// buffered-amount-low callback, with a coarse ticker as a safety net in case
+// the callback is missed (e.g., the channel dies without firing OnClose).
 func (s *dataChannelStream) waitForWritable() error {
 	if s.dc == nil {
 		return io.ErrClosedPipe
 	}
 
-	timer := time.NewTimer(dataChannelWriteTimeout)
-	defer timer.Stop()
-
-	ticker := time.NewTicker(dataChannelDrainInterval)
-	defer ticker.Stop()
+	var (
+		timer  *time.Timer
+		ticker *time.Ticker
+	)
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+			ticker.Stop()
+		}
+	}()
 
 	for {
 		state := s.dc.ReadyState()
@@ -185,8 +293,16 @@ func (s *dataChannelStream) waitForWritable() error {
 			return nil
 		}
 
+		if timer == nil {
+			timer = time.NewTimer(dataChannelWriteTimeout)
+			ticker = time.NewTicker(dataChannelDrainInterval)
+		}
+
 		select {
+		case <-s.writable:
 		case <-ticker.C:
+		case <-s.closed:
+			return io.ErrClosedPipe
 		case <-timer.C:
 			return context.DeadlineExceeded
 		}
