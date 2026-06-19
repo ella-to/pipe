@@ -32,7 +32,7 @@
 ## Installation
 
 ```bash
-go get ella.to/pipe@v0.1.3
+go get ella.to/pipe@v0.1.4
 ```
 
 ## Quick Start
