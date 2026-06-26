@@ -19,6 +19,8 @@ import (
 
 var statusFunc atomic.Value
 
+type PeerConnectionState = webrtc.PeerConnectionState
+
 type StatusFunc func(conn *Conn, status webrtc.PeerConnectionState)
 
 func SetStatusFunc(f StatusFunc) {
