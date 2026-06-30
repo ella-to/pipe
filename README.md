@@ -24,6 +24,7 @@
 
 - **Simple API**: Dial and listen like standard Go networking
 - **`io.ReadWriteCloser` interface**: Use familiar patterns for reading/writing data
+- **`Peer` overlay**: String-addressed, many-to-many datagram messaging (`net.PacketConn`-style `WriteTo`/`ReadFrom`) with on-demand dialing, idle eviction, and automatic reconnect
 - **Pluggable signaling**: Bring your own signaling mechanism (SSE, WebSocket, etc.)
 - **Built-in STUN/TURN servers**: Optional packages for self-hosted ICE infrastructure
 - **Dynamic credentials**: Time-limited TURN authentication (REST API style)
@@ -32,7 +33,7 @@
 ## Installation
 
 ```bash
-go get ella.to/pipe@v0.1.5
+go get ella.to/pipe@v0.1.6
 ```
 
 ## Quick Start
@@ -205,6 +206,198 @@ pipe.SetStatusFunc(func(c *pipe.Conn, status webrtc.PeerConnectionState) {
     log.Printf("Connection %s: %s", c.ID(), status)
 })
 ```
+
+## Peer: Many-to-Many Datagram Messaging
+
+While `Conn` is a single point-to-point connection you dial or accept explicitly,
+a `Peer` is a higher-level overlay that lets one node talk to **many** other nodes
+by id, without managing each connection by hand. It behaves like a
+[`net.PacketConn`](https://pkg.go.dev/net#PacketConn) keyed by a string peer id
+instead of a `net.Addr`:
+
+```go
+WriteTo(peerID string, b []byte) (int, error)        // send a datagram to peerID
+ReadFrom(b []byte) (n int, from string, err error)   // receive the next datagram + sender
+Close() error                                         // detach and tear everything down
+```
+
+A `Peer` is simultaneously a dialer and a listener under the hood. Each remote
+peer is reached over a single bidirectional WebRTC connection that is **dialed on
+demand** the first time you `WriteTo` it, kept warm while in use, **evicted after
+30s idle**, and **transparently re-established** on the next `WriteTo`.
+
+### Quick Example
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "net/http/httptest"
+
+    "ella.to/pipe"
+    "ella.to/pipe/signal/sse"
+)
+
+func main() {
+    // 1. A signaling server that enforces unique peer ids (HTTP 409 on duplicates).
+    signalServer, err := pipe.NewPeerSignalServer()
+    if err != nil {
+        log.Fatal(err)
+    }
+    ts := httptest.NewServer(signalServer) // in production, mount on your own http.Server
+    defer ts.Close()
+
+    // 2. Each peer connects through its own signaling client.
+    aliceSig, _ := sse.NewClient(ts.URL)
+    bobSig, _ := sse.NewClient(ts.URL)
+
+    alice, err := pipe.NewPeer("alice", aliceSig)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer alice.Close()
+
+    bob, err := pipe.NewPeer("bob", bobSig)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer bob.Close()
+
+    // 3. alice sends to bob — the WebRTC connection is dialed automatically.
+    if _, err := alice.WriteTo("bob", []byte("hello bob")); err != nil {
+        log.Fatal(err)
+    }
+
+    // 4. bob receives the datagram and learns who sent it.
+    buf := make([]byte, 64*1024)
+    n, from, err := bob.ReadFrom(buf)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("bob received %q from %q\n", buf[:n], from)
+    // bob received "hello bob" from "alice"
+
+    // 5. bob replies over the same bidirectional connection.
+    bob.WriteTo("alice", []byte("hi alice"))
+    n, from, _ = alice.ReadFrom(buf)
+    fmt.Printf("alice received %q from %q\n", buf[:n], from)
+    // alice received "hi alice" from "bob"
+}
+```
+
+### Echo Server: Reply to Whoever Sent the Datagram
+
+Because `ReadFrom` returns the sender's id, building a server that responds to
+many clients is just a loop:
+
+```go
+peer, _ := pipe.NewPeer("echo-server", sig)
+defer peer.Close()
+
+buf := make([]byte, 64*1024)
+for {
+    n, from, err := peer.ReadFrom(buf)
+    if err != nil {
+        if errors.Is(err, io.ErrClosedPipe) {
+            return // peer was closed
+        }
+        log.Printf("read error: %v", err)
+        continue
+    }
+
+    // Echo the datagram straight back to its sender.
+    if _, err := peer.WriteTo(from, buf[:n]); err != nil {
+        log.Printf("write to %s: %v", from, err)
+    }
+}
+```
+
+### Configuration
+
+```go
+peer, err := pipe.NewPeer("alice", sig,
+    pipe.WithPeerIdleTimeout(60*time.Second),    // evict sessions idle this long (default 30s)
+    pipe.WithPeerDialTimeout(15*time.Second),    // bound each on-demand dial (default 30s)
+    pipe.WithPeerRecvBuffer(1024),               // inbound datagram queue depth (default 256)
+    pipe.WithPeerWebRTCOptions(&pipe.WebRTCOptions{ // custom ICE servers, etc.
+        ICEServers: myICEServers,
+    }),
+)
+```
+
+### Testing with In-Memory Signaling
+
+For tests, swap the SSE client for the in-memory bus — no HTTP server required:
+
+```go
+import "ella.to/pipe/signal/testsignal"
+
+bus := testsignal.New()
+alice, _ := pipe.NewPeer("alice", bus)
+bob, _ := pipe.NewPeer("bob", bus)
+```
+
+### Observability
+
+```go
+peer.ID()              // this peer's own id
+peer.ConnectedPeers()  // ids of peers with a currently live session, e.g. ["bob", "carol"]
+```
+
+### Behavior & Semantics
+
+- **On-demand dialing**: `WriteTo` reuses a live connection if present, otherwise
+  dials the peer through the signal channel. Concurrent writes to the same new
+  peer share a single dial.
+- **Automatic reconnect**: if a cached session is dead (e.g. it was evicted, or the
+  remote went away), `WriteTo` evicts it and re-dials within the **same** call.
+- **Idle eviction**: a session with no successful read or write for the idle
+  timeout (default 30s) is closed and dropped; the next `WriteTo` re-establishes it.
+- **Datagram semantics**: message boundaries are preserved (length-framed). If your
+  `ReadFrom` buffer is smaller than the datagram, the excess is **discarded**, just
+  like `net.PacketConn`. Max datagram size is **1 MiB** (`ErrDatagramTooLarge`).
+- **Sender attribution**: the initiator announces its id in a one-frame handshake,
+  so `ReadFrom` always reports a correct `from`.
+- **Close**: tears down every session and detaches from the signal server (closing
+  the long-lived SSE subscription, which frees the id). After `Close`, `WriteTo`
+  and `ReadFrom` return `io.ErrClosedPipe`. `Close` is idempotent.
+- **Unique ids**: `PeerSignalServer` rejects a second peer claiming an id that is
+  already registered with **HTTP 409 Conflict**, until the holder disconnects.
+
+> **Mesh topology:**
+>
+> ```
+>           ┌─────────┐
+>           │  alice  │
+>           └────┬────┘
+>        WriteTo │ "bob"      WriteTo "carol"
+>          ┌─────┴─────┐──────────────┐
+>          ▼           ▼              ▼
+>     ┌─────────┐ ┌─────────┐    ┌─────────┐
+>     │   bob   │ │  carol  │ …  │   dave  │
+>     └─────────┘ └─────────┘    └─────────┘
+>   each edge = one on-demand WebRTC connection, evicted when idle
+> ```
+
+### Hosting the Peer Signal Server
+
+`PeerSignalServer` is a drop-in `http.Handler` (it wraps the SSE server and adds
+id-uniqueness enforcement):
+
+```go
+signalServer, err := pipe.NewPeerSignalServer()
+if err != nil {
+    log.Fatal(err)
+}
+
+mux := http.NewServeMux()
+mux.Handle("/signal", signalServer)
+log.Fatal(http.ListenAndServe(":8080", mux))
+```
+
+Peers then point their SSE client at it: `sse.NewClient("http://your-host:8080/signal")`.
 
 ## Signaling
 
@@ -509,6 +702,8 @@ if err := conn.WaitReady(ctx); err != nil {
 | `Conn` | WebRTC data channel connection implementing `io.ReadWriteCloser` |
 | `Dialer` | Creates outbound connections |
 | `Listener` | Accepts inbound connections |
+| `Peer` | String-addressed, many-to-many datagram overlay (`net.PacketConn`-style) |
+| `PeerSignalServer` | `http.Handler` signaling server that enforces unique peer ids |
 | `WebRTCOptions` | Configuration for ICE servers and NAT traversal |
 
 ### Functions
@@ -519,6 +714,12 @@ if err := conn.WaitReady(ctx); err != nil {
 | `CreateDialerWithOptions(id, sig, opts)` | Create a dialer with custom ICE configuration |
 | `CreateListener(id, sig)` | Create a listener with default options |
 | `CreateListenerWithOptions(id, sig, opts)` | Create a listener with custom ICE configuration |
+| `NewPeer(id, sig, opts...)` | Create a many-to-many datagram peer |
+| `NewPeerSignalServer(opts...)` | Create a signaling `http.Handler` that enforces unique peer ids |
+| `WithPeerIdleTimeout(d)` | Peer option: idle timeout before a session is evicted (default 30s) |
+| `WithPeerDialTimeout(d)` | Peer option: bound on each on-demand dial (default 30s) |
+| `WithPeerRecvBuffer(n)` | Peer option: inbound datagram queue depth (default 256) |
+| `WithPeerWebRTCOptions(opts)` | Peer option: ICE/NAT configuration for dialing and listening |
 | `SetStatusFunc(fn)` | Set global connection status callback |
 
 ### Conn Methods
@@ -535,6 +736,19 @@ if err := conn.WaitReady(ctx); err != nil {
 | `WaitReady(ctx)` | Block until connection is ready |
 | `WaitClosed(ctx)` | Block until connection is closed |
 | `Stream(initialValue...)` | Open/accept stream with optional initial metadata; returns received init bytes |
+
+### Peer Methods
+
+| Method | Description |
+|--------|-------------|
+| `WriteTo(peerID, b)` | Send a datagram to `peerID`, dialing/reconnecting on demand; returns `len(b)` |
+| `ReadFrom(b)` | Receive the next datagram from any peer; returns `(n, from, err)` |
+| `Close()` | Tear down all sessions and detach from the signal server (idempotent) |
+| `ID()` | This peer's own id |
+| `ConnectedPeers()` | Ids of peers with a currently live session |
+
+After `Close`, `WriteTo` and `ReadFrom` return `io.ErrClosedPipe`. Other sentinel
+errors: `ErrEmptyPeerID`, `ErrSelfPeer`, `ErrDatagramTooLarge`.
 
 ## License
 

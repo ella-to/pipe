@@ -31,18 +31,20 @@ func TestConn_Stream_SingleStream(t *testing.T) {
 	var (
 		dialerConn   *pipe.Conn
 		listenerConn *pipe.Conn
-		wg           sync.WaitGroup
 	)
 
-	// Start listener
-	wg.Add(1)
+	// Start listener. The accepted conn is handed back over a channel so the
+	// main goroutine's read happens-after the listener goroutine's write
+	// (avoids a data race on a shared variable that a bare time.Sleep cannot).
+	listenerConnCh := make(chan *pipe.Conn, 1)
 	go func() {
-		defer wg.Done()
-		var lerr error
-		listenerConn, lerr = listener.Listen(ctx)
+		conn, lerr := listener.Listen(ctx)
 		if lerr != nil {
 			t.Errorf("Listen failed: %v", lerr)
+			close(listenerConnCh)
+			return
 		}
+		listenerConnCh <- conn
 	}()
 
 	// Dial
@@ -52,8 +54,11 @@ func TestConn_Stream_SingleStream(t *testing.T) {
 	}
 	defer dialerConn.Close()
 
-	// Wait for listener
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the listener to accept and hand back its connection.
+	listenerConn = <-listenerConnCh
+	if listenerConn == nil {
+		t.Fatal("listener returned no connection")
+	}
 
 	// Test single stream
 	testData := []byte("hello from dialer stream")
@@ -101,7 +106,6 @@ func TestConn_Stream_SingleStream(t *testing.T) {
 	}
 
 	listenerConn.Close()
-	wg.Wait()
 }
 
 func TestConn_Stream_MultipleStreams(t *testing.T) {
@@ -123,18 +127,20 @@ func TestConn_Stream_MultipleStreams(t *testing.T) {
 	var (
 		dialerConn   *pipe.Conn
 		listenerConn *pipe.Conn
-		wg           sync.WaitGroup
 	)
 
-	// Start listener
-	wg.Add(1)
+	// Start listener. The accepted conn is handed back over a channel so the
+	// main goroutine's read happens-after the listener goroutine's write
+	// (avoids a data race on a shared variable that a bare time.Sleep cannot).
+	listenerConnCh := make(chan *pipe.Conn, 1)
 	go func() {
-		defer wg.Done()
-		var lerr error
-		listenerConn, lerr = listener.Listen(ctx)
+		conn, lerr := listener.Listen(ctx)
 		if lerr != nil {
 			t.Errorf("Listen failed: %v", lerr)
+			close(listenerConnCh)
+			return
 		}
+		listenerConnCh <- conn
 	}()
 
 	// Dial
@@ -144,8 +150,11 @@ func TestConn_Stream_MultipleStreams(t *testing.T) {
 	}
 	defer dialerConn.Close()
 
-	// Wait for listener
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the listener to accept and hand back its connection.
+	listenerConn = <-listenerConnCh
+	if listenerConn == nil {
+		t.Fatal("listener returned no connection")
+	}
 
 	const numStreams = 3
 	messages := []string{
@@ -203,7 +212,6 @@ func TestConn_Stream_MultipleStreams(t *testing.T) {
 	}
 
 	listenerConn.Close()
-	wg.Wait()
 }
 
 func TestConn_Stream_Bidirectional(t *testing.T) {
@@ -225,18 +233,20 @@ func TestConn_Stream_Bidirectional(t *testing.T) {
 	var (
 		dialerConn   *pipe.Conn
 		listenerConn *pipe.Conn
-		wg           sync.WaitGroup
 	)
 
-	// Start listener
-	wg.Add(1)
+	// Start listener. The accepted conn is handed back over a channel so the
+	// main goroutine's read happens-after the listener goroutine's write
+	// (avoids a data race on a shared variable that a bare time.Sleep cannot).
+	listenerConnCh := make(chan *pipe.Conn, 1)
 	go func() {
-		defer wg.Done()
-		var lerr error
-		listenerConn, lerr = listener.Listen(ctx)
+		conn, lerr := listener.Listen(ctx)
 		if lerr != nil {
 			t.Errorf("Listen failed: %v", lerr)
+			close(listenerConnCh)
+			return
 		}
+		listenerConnCh <- conn
 	}()
 
 	// Dial
@@ -246,8 +256,11 @@ func TestConn_Stream_Bidirectional(t *testing.T) {
 	}
 	defer dialerConn.Close()
 
-	// Wait for listener
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the listener to accept and hand back its connection.
+	listenerConn = <-listenerConnCh
+	if listenerConn == nil {
+		t.Fatal("listener returned no connection")
+	}
 
 	// Open stream on dialer
 	dialerStream, _, err := dialerConn.Stream()
@@ -306,7 +319,6 @@ func TestConn_Stream_Bidirectional(t *testing.T) {
 
 	recvWg.Wait()
 	listenerConn.Close()
-	wg.Wait()
 }
 
 func TestConn_Stream_InitialValue(t *testing.T) {
@@ -328,18 +340,20 @@ func TestConn_Stream_InitialValue(t *testing.T) {
 	var (
 		dialerConn   *pipe.Conn
 		listenerConn *pipe.Conn
-		wg           sync.WaitGroup
 	)
 
-	// Start listener
-	wg.Add(1)
+	// Start listener. The accepted conn is handed back over a channel so the
+	// main goroutine's read happens-after the listener goroutine's write
+	// (avoids a data race on a shared variable that a bare time.Sleep cannot).
+	listenerConnCh := make(chan *pipe.Conn, 1)
 	go func() {
-		defer wg.Done()
-		var lerr error
-		listenerConn, lerr = listener.Listen(ctx)
+		conn, lerr := listener.Listen(ctx)
 		if lerr != nil {
 			t.Errorf("Listen failed: %v", lerr)
+			close(listenerConnCh)
+			return
 		}
+		listenerConnCh <- conn
 	}()
 
 	// Dial
@@ -349,8 +363,11 @@ func TestConn_Stream_InitialValue(t *testing.T) {
 	}
 	defer dialerConn.Close()
 
-	// Wait for listener
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the listener to accept and hand back its connection.
+	listenerConn = <-listenerConnCh
+	if listenerConn == nil {
+		t.Fatal("listener returned no connection")
+	}
 
 	initial := []byte("token:stream-1")
 	payload := []byte("hello over stream")
@@ -389,7 +406,6 @@ func TestConn_Stream_InitialValue(t *testing.T) {
 	}
 
 	listenerConn.Close()
-	wg.Wait()
 }
 
 func TestConn_Stream_InitialValueOptional(t *testing.T) {
@@ -411,18 +427,20 @@ func TestConn_Stream_InitialValueOptional(t *testing.T) {
 	var (
 		dialerConn   *pipe.Conn
 		listenerConn *pipe.Conn
-		wg           sync.WaitGroup
 	)
 
-	// Start listener
-	wg.Add(1)
+	// Start listener. The accepted conn is handed back over a channel so the
+	// main goroutine's read happens-after the listener goroutine's write
+	// (avoids a data race on a shared variable that a bare time.Sleep cannot).
+	listenerConnCh := make(chan *pipe.Conn, 1)
 	go func() {
-		defer wg.Done()
-		var lerr error
-		listenerConn, lerr = listener.Listen(ctx)
+		conn, lerr := listener.Listen(ctx)
 		if lerr != nil {
 			t.Errorf("Listen failed: %v", lerr)
+			close(listenerConnCh)
+			return
 		}
+		listenerConnCh <- conn
 	}()
 
 	// Dial
@@ -432,8 +450,11 @@ func TestConn_Stream_InitialValueOptional(t *testing.T) {
 	}
 	defer dialerConn.Close()
 
-	// Wait for listener
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the listener to accept and hand back its connection.
+	listenerConn = <-listenerConnCh
+	if listenerConn == nil {
+		t.Fatal("listener returned no connection")
+	}
 
 	dialerStream, dialerInit, err := dialerConn.Stream()
 	if err != nil {
@@ -456,7 +477,6 @@ func TestConn_Stream_InitialValueOptional(t *testing.T) {
 	}
 
 	listenerConn.Close()
-	wg.Wait()
 }
 
 func TestConn_Stream_ListenerCannotSetInitialValue(t *testing.T) {
@@ -475,20 +495,20 @@ func TestConn_Stream_ListenerCannotSetInitialValue(t *testing.T) {
 		t.Fatalf("CreateListener failed: %v", err)
 	}
 
-	var (
-		listenerConn *pipe.Conn
-		wg           sync.WaitGroup
-	)
+	var listenerConn *pipe.Conn
 
-	// Start listener
-	wg.Add(1)
+	// Start listener. The accepted conn is handed back over a channel so the
+	// main goroutine's read happens-after the listener goroutine's write
+	// (avoids a data race on a shared variable that a bare time.Sleep cannot).
+	listenerConnCh := make(chan *pipe.Conn, 1)
 	go func() {
-		defer wg.Done()
-		var lerr error
-		listenerConn, lerr = listener.Listen(ctx)
+		conn, lerr := listener.Listen(ctx)
 		if lerr != nil {
 			t.Errorf("Listen failed: %v", lerr)
+			close(listenerConnCh)
+			return
 		}
+		listenerConnCh <- conn
 	}()
 
 	conn, err := dialer.Dial(ctx, "listener")
@@ -497,14 +517,16 @@ func TestConn_Stream_ListenerCannotSetInitialValue(t *testing.T) {
 	}
 	defer conn.Close()
 
-	time.Sleep(100 * time.Millisecond)
+	listenerConn = <-listenerConnCh
+	if listenerConn == nil {
+		t.Fatal("listener returned no connection")
+	}
 
 	if _, _, err := listenerConn.Stream([]byte("not-allowed")...); err != pipe.ErrInitialValueOnListener {
 		t.Fatalf("listenerConn.Stream(non-empty) error = %v, want %v", err, pipe.ErrInitialValueOnListener)
 	}
 
 	listenerConn.Close()
-	wg.Wait()
 }
 
 func TestConn_NumStreams_BeforeStream(t *testing.T) {
@@ -523,20 +545,20 @@ func TestConn_NumStreams_BeforeStream(t *testing.T) {
 		t.Fatalf("CreateListener failed: %v", err)
 	}
 
-	var (
-		listenerConn *pipe.Conn
-		wg           sync.WaitGroup
-	)
+	var listenerConn *pipe.Conn
 
-	// Start listener
-	wg.Add(1)
+	// Start listener. The accepted conn is handed back over a channel so the
+	// main goroutine's read happens-after the listener goroutine's write
+	// (avoids a data race on a shared variable that a bare time.Sleep cannot).
+	listenerConnCh := make(chan *pipe.Conn, 1)
 	go func() {
-		defer wg.Done()
-		var lerr error
-		listenerConn, lerr = listener.Listen(ctx)
+		conn, lerr := listener.Listen(ctx)
 		if lerr != nil {
 			t.Errorf("Listen failed: %v", lerr)
+			close(listenerConnCh)
+			return
 		}
+		listenerConnCh <- conn
 	}()
 
 	// Dial
@@ -546,8 +568,8 @@ func TestConn_NumStreams_BeforeStream(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Wait for listener to establish
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the listener to accept and hand back its connection.
+	listenerConn = <-listenerConnCh
 
 	// NumStreams should be 0 before any Stream() call
 	if n := conn.NumStreams(); n != 0 {
@@ -561,5 +583,4 @@ func TestConn_NumStreams_BeforeStream(t *testing.T) {
 		listenerConn.Close()
 	}
 
-	wg.Wait()
 }
