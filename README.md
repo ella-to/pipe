@@ -445,7 +445,40 @@ dialer, _ := pipe.CreateDialer("B", sig)
 
 ## Custom ICE Configuration
 
-### Using Custom STUN/TURN Servers
+### Adding TURN Relays (recommended)
+
+The default configuration ships with Google's public STUN servers, which are
+enough for many NAT scenarios but cannot relay traffic when both peers are
+behind restrictive NATs/firewalls. In that case you need a TURN server.
+
+`WithPeerTURN` / `TURNServers` are **additive**: they add relays on top of the
+existing STUN servers, so you don't have to re-list the defaults.
+
+```go
+turnServer := pipe.NewTURNServer(
+    "turn:turn.example.com:3478?transport=udp", // URL
+    "user",                                      // username
+    "pass",                                      // credential
+)
+
+// Peer API
+p, err := pipe.NewPeer("my-id", sig, pipe.WithPeerTURN(turnServer))
+
+// Dialer/Listener API
+opts := &pipe.WebRTCOptions{
+    TURNServers: []pipe.TURNServer{turnServer},
+}
+dialer, err := pipe.CreateDialerWithOptions("my-id", sig, opts)
+listener, err := pipe.CreateListenerWithOptions("my-id", sig, opts)
+```
+
+If you run the bundled TURN server (see [Self-Hosted TURN Server](#self-hosted-turn-server)),
+you can feed its `ICEServerFor(username)` straight into `ICEServers`.
+
+### Replacing the Full ICE Server List
+
+Set `ICEServers` to take complete control. When non-empty it **replaces** the
+default STUN servers (any `TURNServers` are still appended on top).
 
 ```go
 import "github.com/pion/webrtc/v4"
@@ -458,16 +491,16 @@ opts := &pipe.WebRTCOptions{
         },
         // TURN server with credentials
         {
-            URLs:       []string{"turn:turn.example.com:3478?transport=udp"},
-            Username:   "user",
-            Credential: "pass",
+            URLs:           []string{"turn:turn.example.com:3478?transport=udp"},
+            Username:       "user",
+            Credential:     "pass",
             CredentialType: webrtc.ICECredentialTypePassword,
         },
         // TURNS (TLS) server
         {
-            URLs:       []string{"turns:turn.example.com:5349?transport=tcp"},
-            Username:   "user",
-            Credential: "pass",
+            URLs:           []string{"turns:turn.example.com:5349?transport=tcp"},
+            Username:       "user",
+            Credential:     "pass",
             CredentialType: webrtc.ICECredentialTypePassword,
         },
     },
@@ -479,17 +512,43 @@ listener, err := pipe.CreateListenerWithOptions("my-id", sig, opts)
 
 ### Force Relay-Only (TURN)
 
+Use relay-only mode to verify that your TURN server actually works: the
+connection uses only relay candidates and **fails** rather than falling back to
+a direct path.
+
 ```go
+// Peer API
+p, err := pipe.NewPeer("my-id", sig,
+    pipe.WithPeerTURN(turnServer),
+    pipe.WithPeerForceRelay(),
+)
+
+// Dialer/Listener API
 opts := &pipe.WebRTCOptions{
-    ICEServers: []webrtc.ICEServer{
-        {
-            URLs:       []string{"turn:turn.example.com:3478"},
-            Username:   "user",
-            Credential: "pass",
-        },
-    },
-    ICETransportPolicy: webrtc.ICETransportPolicyRelay,
+    TURNServers: []pipe.TURNServer{turnServer},
+    ForceRelay:  true,
 }
+```
+
+### Verifying the Connection Path
+
+When a connection is established, pipe logs (via `slog`) how the data path was
+formed and whether TURN was required:
+
+```
+INFO connection established id=my-id role=dialer path="relay (TURN)" required_turn=true
+     protocol=udp local_candidate=relay  local_addr=203.0.113.10:54032
+                   remote_candidate=srflx remote_addr=198.51.100.7:51820
+```
+
+Enable `slog` debug level to also see the ICE configuration, signaling
+handshake, and ICE/connection state transitions — useful for diagnosing why a
+connection never establishes:
+
+```go
+slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+    Level: slog.LevelDebug,
+})))
 ```
 
 ### NAT 1:1 IP Mapping

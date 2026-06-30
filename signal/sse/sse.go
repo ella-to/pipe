@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -47,6 +48,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		msgCh := s.mapper.Subscribe(inbox.String())
 		defer s.mapper.Unsubscribe(inbox.String(), msgCh)
+		slog.DebugContext(r.Context(), "signal server subscription opened", "inbox", inbox.String())
+		defer slog.DebugContext(r.Context(), "signal server subscription closed", "inbox", inbox.String())
 		var msgCount int64
 
 		for {
@@ -128,8 +131,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) Send(ctx context.Context, inbox *signal.Inbox, msg *signal.Msg) error {
 	select {
 	case s.mapper.Get(inbox.String()) <- msg:
+		slog.DebugContext(ctx, "signal server routed message", "inbox", inbox.String(), "type", msg.Type.String())
 		return nil
 	default:
+		// The inbox channel is full (or has no reader keeping up). The message
+		// is dropped, which on the client side surfaces as a connection that
+		// never completes its handshake.
+		slog.WarnContext(ctx, "signal server dropped message; inbox buffer full or no active subscriber", "inbox", inbox.String(), "type", msg.Type.String())
 		return fmt.Errorf("failed to send message to inbox: %s", inbox.String())
 	}
 }
@@ -210,12 +218,14 @@ func (c *Client) Send(ctx context.Context, inbox *signal.Inbox, msg *signal.Msg)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		slog.ErrorContext(ctx, "signal client failed to POST message", "inbox", inbox.String(), "type", msg.Type.String(), "url", url, "err", err)
 		return err
 	}
 
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusAccepted {
+		slog.DebugContext(ctx, "signal client sent message", "inbox", inbox.String(), "type", msg.Type.String())
 		return nil
 	}
 
@@ -224,6 +234,7 @@ func (c *Client) Send(ctx context.Context, inbox *signal.Inbox, msg *signal.Msg)
 		return err
 	}
 
+	slog.ErrorContext(ctx, "signal client got non-accepted response", "inbox", inbox.String(), "type", msg.Type.String(), "status", resp.StatusCode, "body", string(errMsg))
 	return fmt.Errorf("failed to send message, status code: %d: %s", resp.StatusCode, errMsg)
 }
 
@@ -235,8 +246,10 @@ func (c *Client) Receiver(inbox *signal.Inbox) (signal.Receiver, error) {
 
 	receiver, err := sse.CreateHttpReceiver(url, sse.WithHttpReceiverClient(c.httpClient))
 	if err != nil {
+		slog.Error("signal client failed to create SSE receiver", "inbox", inbox.String(), "url", url, "err", err)
 		return nil, err
 	}
+	slog.Debug("signal client opened SSE receiver", "inbox", inbox.String())
 
 	return &clientReceiver{
 		receive: func(ctx context.Context) (*signal.Msg, error) {
@@ -267,6 +280,9 @@ func (c *Client) Receiver(inbox *signal.Inbox) (signal.Receiver, error) {
 				}
 
 				if err != nil {
+					if ctx.Err() == nil {
+						slog.Debug("signal client receive error", "inbox", inbox.String(), "err", err)
+					}
 					return nil, err
 				}
 

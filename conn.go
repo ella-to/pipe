@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,12 +49,58 @@ var defaultConfig = webrtc.Configuration{
 	},
 }
 
+// TURNServer describes a single TURN/TURNS relay server and its credentials.
+// It is a convenience wrapper over webrtc.ICEServer for the common case of
+// adding a password-authenticated TURN server.
+//
+// URLs example values:
+//
+//	"turn:turn.example.com:3478?transport=udp"
+//	"turn:turn.example.com:3478?transport=tcp"
+//	"turns:turn.example.com:5349?transport=tcp"
+type TURNServer struct {
+	URLs       []string
+	Username   string
+	Credential string
+}
+
+// NewTURNServer builds a TURNServer for a single URL with username/password
+// credentials.
+func NewTURNServer(url, username, credential string) TURNServer {
+	return TURNServer{
+		URLs:       []string{url},
+		Username:   username,
+		Credential: credential,
+	}
+}
+
+func (t TURNServer) iceServer() webrtc.ICEServer {
+	return webrtc.ICEServer{
+		URLs:           t.URLs,
+		Username:       t.Username,
+		Credential:     t.Credential,
+		CredentialType: webrtc.ICECredentialTypePassword,
+	}
+}
+
 // WebRTCOptions allows configuring the underlying WebRTC API and ICE servers.
 //
-// ICEServers: list of STUN/TURN servers to use (overrides the default if non-empty).
+// ICEServers: full STUN/TURN server list. When non-empty it REPLACES the
+// default STUN servers; when empty the built-in Google STUN servers are used.
+//
+// TURNServers: TURN relays to ADD on top of ICEServers (or the default STUN
+// list). This is the easy way to enable relay support without having to
+// re-specify the default STUN servers.
+//
+// ForceRelay: when true, only relay (TURN) candidates are used — the connection
+// will fail rather than fall back to a direct path. Useful for testing that
+// your TURN server actually works.
+//
 // NAT1To1IPs: if running behind NAT, set your public IPs so candidates are rewritten.
 type WebRTCOptions struct {
-	ICEServers []webrtc.ICEServer
+	ICEServers  []webrtc.ICEServer
+	TURNServers []TURNServer
+	ForceRelay  bool
 	// NAT1To1IPs         []string
 	ICETransportPolicy          webrtc.ICETransportPolicy // optional (default: all)
 	DisconnectSignalOnConnected bool
@@ -69,19 +117,58 @@ func newWebrtcAPI(opts *WebRTCOptions) (*webrtc.API, error) {
 }
 
 func buildConfiguration(opts *WebRTCOptions) webrtc.Configuration {
-	if opts != nil {
-		cfg := webrtc.Configuration{}
-		if len(opts.ICEServers) > 0 {
-			cfg.ICEServers = opts.ICEServers
-		} else {
-			cfg = defaultConfig
-		}
-		if opts.ICETransportPolicy != 0 {
-			cfg.ICETransportPolicy = opts.ICETransportPolicy
-		}
-		return cfg
+	if opts == nil {
+		return defaultConfig
 	}
-	return defaultConfig
+
+	cfg := webrtc.Configuration{}
+
+	// Base list: explicit ICEServers if provided, otherwise the default STUN
+	// servers. Append rather than alias so we never mutate defaultConfig.
+	if len(opts.ICEServers) > 0 {
+		cfg.ICEServers = append(cfg.ICEServers, opts.ICEServers...)
+	} else {
+		cfg.ICEServers = append(cfg.ICEServers, defaultConfig.ICEServers...)
+	}
+
+	// TURN relays are additive on top of the base list.
+	for _, t := range opts.TURNServers {
+		cfg.ICEServers = append(cfg.ICEServers, t.iceServer())
+	}
+
+	switch {
+	case opts.ForceRelay:
+		cfg.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+	case opts.ICETransportPolicy != 0:
+		cfg.ICETransportPolicy = opts.ICETransportPolicy
+	}
+
+	logICEConfiguration(cfg)
+
+	return cfg
+}
+
+// logICEConfiguration emits a one-line summary of the ICE servers in use, which
+// is helpful when diagnosing why a connection cannot be established (e.g. no
+// TURN server configured, or relay-only with a broken TURN server).
+func logICEConfiguration(cfg webrtc.Configuration) {
+	urls := make([]string, 0, len(cfg.ICEServers))
+	hasTURN := false
+	for _, s := range cfg.ICEServers {
+		urls = append(urls, s.URLs...)
+		for _, u := range s.URLs {
+			if strings.HasPrefix(u, "turn:") || strings.HasPrefix(u, "turns:") {
+				hasTURN = true
+			}
+		}
+	}
+
+	policy := "all"
+	if cfg.ICETransportPolicy == webrtc.ICETransportPolicyRelay {
+		policy = "relay-only"
+	}
+
+	slog.Debug("ice configuration", "servers", urls, "has_turn", hasTURN, "policy", policy)
 }
 
 // ErrMultiplexingActive is returned when Read/Write is called after Stream() has been used.
@@ -136,6 +223,14 @@ func (c *Conn) ID() string {
 		return serverID
 	}
 	return c.id
+}
+
+// role returns "dialer" or "listener" for logging/diagnostics.
+func (c *Conn) role() string {
+	if c.isDialer {
+		return "dialer"
+	}
+	return "listener"
 }
 
 func (c *Conn) IsReady() bool {
@@ -462,10 +557,26 @@ func isClosedError(err error) bool {
 }
 
 func (c *Conn) setupHandlers(ctx context.Context) {
+	role := c.role()
+
+	c.pc.OnICEGatheringStateChange(func(s webrtc.ICEGatheringState) {
+		slog.Debug("ice gathering state changed", "id", c.id, "role", role, "state", s.String())
+	})
+
+	c.pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
+		// ICE connection state is the clearest signal of whether the two peers
+		// can actually reach each other (e.g. stuck in "checking" usually means
+		// no working candidate pair / NAT or STUN/TURN problem).
+		slog.Info("ice connection state changed", "id", c.id, "role", role, "state", s.String())
+	})
+
 	c.pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
+			slog.Debug("ice candidate gathering finished", "id", c.id, "role", role)
 			return
 		}
+
+		slog.Debug("sending local ice candidate", "id", c.id, "role", role, "candidate", candidate.String())
 
 		if sigErr := sendMsg(
 			context.WithoutCancel(ctx),
@@ -476,23 +587,87 @@ func (c *Conn) setupHandlers(ctx context.Context) {
 				candidate.ToJSON(),
 			),
 		); sigErr != nil {
-			slog.ErrorContext(ctx, "failed to send ice candidate", "id", c.id, "inbox", c.sendInbox, "err", sigErr)
+			slog.ErrorContext(ctx, "failed to send ice candidate", "id", c.id, "role", role, "inbox", c.sendInbox, "err", sigErr)
 		}
 	})
 
 	c.pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		slog.Info("peer connection state changed", "id", c.id, "role", role, "state", s.String())
+
 		callStatusFunc(c, s)
 
 		switch s {
 		case webrtc.PeerConnectionStateConnecting:
 		case webrtc.PeerConnectionStateConnected:
+			c.logConnectionPath()
 			if c.disconnectSignalOnConnected {
+				slog.Debug("disconnecting signal receiver after connect", "id", c.id, "role", role)
 				c.disconnectSignal()
 			}
 		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateClosed, webrtc.PeerConnectionStateFailed:
+			slog.Warn("peer connection lost; closing", "id", c.id, "role", role, "state", s.String())
 			c.Close()
 		}
 	})
+}
+
+// logConnectionPath inspects the negotiated ICE candidate pair once the
+// connection is established and logs how the data path was formed: a direct
+// host path, a NAT-traversed path (server-reflexive via STUN), or a relayed
+// path through a TURN server. This answers the common question of whether a
+// connection succeeded and whether it required TURN.
+func (c *Conn) logConnectionPath() {
+	role := c.role()
+
+	sctp := c.pc.SCTP()
+	if sctp == nil {
+		slog.Debug("connected but path unknown: no SCTP transport", "id", c.id, "role", role)
+		return
+	}
+	dtls := sctp.Transport()
+	if dtls == nil {
+		slog.Debug("connected but path unknown: no DTLS transport", "id", c.id, "role", role)
+		return
+	}
+	iceT := dtls.ICETransport()
+	if iceT == nil {
+		slog.Debug("connected but path unknown: no ICE transport", "id", c.id, "role", role)
+		return
+	}
+
+	pair, err := iceT.GetSelectedCandidatePair()
+	if err != nil || pair == nil || pair.Local == nil || pair.Remote == nil {
+		slog.Warn("connected but could not determine selected candidate pair", "id", c.id, "role", role, "err", err)
+		return
+	}
+
+	localType := pair.Local.Typ
+	remoteType := pair.Remote.Typ
+
+	// A relay candidate on either end means traffic flows through a TURN server.
+	requiredTURN := localType == webrtc.ICECandidateTypeRelay || remoteType == webrtc.ICECandidateTypeRelay
+
+	var pathType string
+	switch {
+	case requiredTURN:
+		pathType = "relay (TURN)"
+	case localType == webrtc.ICECandidateTypeHost && remoteType == webrtc.ICECandidateTypeHost:
+		pathType = "direct (host)"
+	default:
+		pathType = "direct (NAT traversal)"
+	}
+
+	slog.Info("connection established",
+		"id", c.id,
+		"role", role,
+		"path", pathType,
+		"required_turn", requiredTURN,
+		"protocol", pair.Local.Protocol.String(),
+		"local_candidate", localType.String(),
+		"local_addr", net.JoinHostPort(pair.Local.Address, strconv.Itoa(int(pair.Local.Port))),
+		"remote_candidate", remoteType.String(),
+		"remote_addr", net.JoinHostPort(pair.Remote.Address, strconv.Itoa(int(pair.Remote.Port))),
+	)
 }
 
 func (c *Conn) setSignalReceiverCloser(closer signal.ReceiverCloser) {
@@ -540,11 +715,14 @@ func (c *Conn) incoming() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	role := c.role()
+
 	receiver, err := c.sig.Receiver(c.recvInbox)
 	if err != nil {
-		slog.ErrorContext(ctx, "failed to create signaling receiver", "id", c.id, "err", err)
+		slog.ErrorContext(ctx, "failed to create signaling receiver", "id", c.id, "role", role, "recv_inbox", c.recvInbox, "err", err)
 		return
 	}
+	slog.Debug("signaling receiver started", "id", c.id, "role", role, "recv_inbox", c.recvInbox)
 	if closer, ok := receiver.(signal.ReceiverCloser); ok {
 		c.setSignalReceiverCloser(closer)
 		defer func() {
@@ -569,9 +747,11 @@ func (c *Conn) incoming() {
 			// so just return to exit the loop and end the goroutine
 			return
 		} else if err != nil {
-			slog.ErrorContext(ctx, "failed to receive signaling message", "id", c.id, "err", err)
+			slog.ErrorContext(ctx, "failed to receive signaling message", "id", c.id, "role", role, "err", err)
 			return
 		}
+
+		slog.Debug("received signaling message", "id", c.id, "role", role, "type", msg.Type.String())
 
 		switch msg.Type {
 		case 0: // Custom message type - could be connection ID from server
@@ -591,21 +771,22 @@ func (c *Conn) incoming() {
 			}
 
 			if err = msg.DecodeBody(&c.sendInbox); err != nil {
-				slog.ErrorContext(ctx, "failed to decode exchange message body", "id", c.id, "err", err)
+				slog.ErrorContext(ctx, "failed to decode exchange message body", "id", c.id, "role", role, "err", err)
 				continue
 			}
 
+			slog.Debug("received remote send inbox via exchange", "id", c.id, "role", role, "send_inbox", c.sendInbox)
 			close(c.sendInboxSet)
 
 		case signal.TypeOffer:
 			var offer webrtc.SessionDescription
 			if err = json.Unmarshal(msg.Body, &offer); err != nil {
-				slog.ErrorContext(ctx, "failed to unmarshal offer", "id", c.id, "err", err)
+				slog.ErrorContext(ctx, "failed to unmarshal offer", "id", c.id, "role", role, "err", err)
 				continue
 			}
 
 			if err = c.pc.SetRemoteDescription(offer); err != nil {
-				slog.ErrorContext(ctx, "failed to set remote description", "id", c.id, "err", err)
+				slog.ErrorContext(ctx, "failed to set remote description", "id", c.id, "role", role, "err", err)
 				continue
 			}
 
@@ -613,12 +794,12 @@ func (c *Conn) incoming() {
 
 			answer, answerErr := c.pc.CreateAnswer(nil)
 			if answerErr != nil {
-				slog.ErrorContext(ctx, "failed to create answer", "id", c.id, "err", answerErr)
+				slog.ErrorContext(ctx, "failed to create answer", "id", c.id, "role", role, "err", answerErr)
 				continue
 			}
 
 			if err = c.pc.SetLocalDescription(answer); err != nil {
-				slog.ErrorContext(ctx, "failed to set local description", "id", c.id, "err", err)
+				slog.ErrorContext(ctx, "failed to set local description", "id", c.id, "role", role, "err", err)
 				continue
 			}
 
@@ -631,37 +812,41 @@ func (c *Conn) incoming() {
 					answer,
 				),
 			); err != nil {
-				slog.ErrorContext(ctx, "failed to send answer", "id", c.id, "err", err)
+				slog.ErrorContext(ctx, "failed to send answer", "id", c.id, "role", role, "err", err)
 				continue
 			}
+
+			slog.Debug("processed offer and sent answer", "id", c.id, "role", role)
 
 		case signal.TypeAnswer:
 			var answer webrtc.SessionDescription
 			if err = json.Unmarshal(msg.Body, &answer); err != nil {
-				slog.ErrorContext(ctx, "failed to unmarshal answer", "id", c.id, "err", err)
+				slog.ErrorContext(ctx, "failed to unmarshal answer", "id", c.id, "role", role, "err", err)
 				continue
 			}
 
 			if err = c.pc.SetRemoteDescription(answer); err != nil {
-				slog.ErrorContext(ctx, "failed to set remote description", "id", c.id, "err", err)
+				slog.ErrorContext(ctx, "failed to set remote description", "id", c.id, "role", role, "err", err)
 				continue
 			}
 
 			c.flushPendingICECandidates()
+			slog.Debug("processed answer and set remote description", "id", c.id, "role", role)
 
 		case signal.TypeCandidate:
 			var candidate webrtc.ICECandidateInit
 			if err = json.Unmarshal(msg.Body, &candidate); err != nil {
-				slog.ErrorContext(ctx, "failed to unmarshal candidate", "id", c.id, "err", err)
+				slog.ErrorContext(ctx, "failed to unmarshal candidate", "id", c.id, "role", role, "err", err)
 				continue
 			}
 
 			if err = c.addICECandidate(candidate); err != nil {
-				slog.ErrorContext(ctx, "failed to add ice candidate", "id", c.id, "err", err)
+				slog.ErrorContext(ctx, "failed to add ice candidate", "id", c.id, "role", role, "err", err)
 				continue
 			}
+			slog.Debug("added remote ice candidate", "id", c.id, "role", role)
 		default:
-			slog.Warn("received unexpected signaling message type", "id", c.id, "type", msg.Type)
+			slog.Warn("received unexpected signaling message type", "id", c.id, "role", role, "type", msg.Type)
 		}
 	}
 }
@@ -742,10 +927,13 @@ func CreateDialerWithOptions(id string, sig signal.Signal, opts *WebRTCOptions) 
 			conn.disconnectSignalOnConnected = opts.DisconnectSignalOnConnected
 		}
 
+		slog.Info("dialing peer", "id", conn.id, "to", to, "recv_inbox", conn.recvInbox)
+
 		defer func() {
 			if err != nil {
+				slog.ErrorContext(ctx, "dial failed", "id", conn.id, "to", to, "err", err)
 				if cerr := conn.Close(); cerr != nil {
-					slog.ErrorContext(ctx, "failed to close connection after dial error", "err", cerr)
+					slog.ErrorContext(ctx, "failed to close connection after dial error", "id", conn.id, "err", cerr)
 				}
 			}
 		}()
@@ -774,11 +962,13 @@ func CreateDialerWithOptions(id string, sig signal.Signal, opts *WebRTCOptions) 
 			stream := newDataChannelStream(dataCh)
 
 			dataCh.OnOpen(func() {
+				slog.Info("data channel open; connection ready", "id", conn.id, "role", "dialer", "to", to)
 				conn.setRaw(stream)
 				close(conn.isReady)
 			})
 
 			dataCh.OnClose(func() {
+				slog.Debug("data channel closed", "id", conn.id, "role", "dialer", "to", to)
 				stream.CloseWithError(io.EOF)
 				conn.Close()
 			})
@@ -796,6 +986,7 @@ func CreateDialerWithOptions(id string, sig signal.Signal, opts *WebRTCOptions) 
 		if err != nil {
 			return nil, err
 		}
+		slog.Debug("sent exchange; waiting for remote inbox", "id", conn.id, "to", to, "main_inbox", getMainInbox(to))
 
 		conn.setupHandlers(ctx)
 
@@ -828,15 +1019,18 @@ func CreateDialerWithOptions(id string, sig signal.Signal, opts *WebRTCOptions) 
 		if err != nil {
 			return nil, err
 		}
+		slog.Debug("sent offer; waiting for connection to become ready", "id", conn.id, "to", to)
 
 		// This is completed when the connection is established or fails
 		select {
 		case <-ctx.Done():
+			slog.WarnContext(ctx, "dial timed out / canceled before connection ready", "id", conn.id, "to", to, "err", ctx.Err())
 			return nil, ctx.Err()
 		case <-conn.isReady:
 			// connection is ready
 		}
 
+		slog.Info("dial completed", "id", conn.ID(), "to", to)
 		return conn, nil
 	}), nil
 }
@@ -970,9 +1164,11 @@ func CreateListenerWithOptions(id string, sig signal.Signal, opts *WebRTCOptions
 			}
 
 			if err = json.Unmarshal(msg.Body, &conn.sendInbox); err != nil {
-				slog.ErrorContext(ctx, "failed to unmarshal inbox from exchange message", "err", err)
+				slog.ErrorContext(ctx, "failed to unmarshal inbox from exchange message", "id", id, "err", err)
 				continue
 			}
+
+			slog.Info("accepted incoming exchange from peer", "id", conn.id, "send_inbox", conn.sendInbox, "recv_inbox", conn.recvInbox)
 
 			err = sendMsg(
 				ctx,
@@ -984,13 +1180,13 @@ func CreateListenerWithOptions(id string, sig signal.Signal, opts *WebRTCOptions
 				),
 			)
 			if err != nil {
-				slog.ErrorContext(ctx, "failed to send exchange message", "err", err)
+				slog.ErrorContext(ctx, "failed to send exchange message", "id", conn.id, "err", err)
 				continue
 			}
 
 			conn.pc, err = api.NewPeerConnection(buildConfiguration(opts))
 			if err != nil {
-				slog.ErrorContext(ctx, "failed to create peer connection", "err", err)
+				slog.ErrorContext(ctx, "failed to create peer connection", "id", conn.id, "err", err)
 				continue
 			}
 
@@ -998,11 +1194,13 @@ func CreateListenerWithOptions(id string, sig signal.Signal, opts *WebRTCOptions
 				stream := newDataChannelStream(dc)
 
 				dc.OnClose(func() {
+					slog.Debug("data channel closed", "id", conn.id, "role", "listener")
 					stream.CloseWithError(io.EOF)
 					conn.Close()
 				})
 
 				dc.OnOpen(func() {
+					slog.Info("data channel open; connection ready", "id", conn.id, "role", "listener")
 					conn.setRaw(stream)
 					close(conn.isReady)
 				})

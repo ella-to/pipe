@@ -121,12 +121,42 @@ func WithPeerRecvBuffer(n int) PeerOption {
 }
 
 // WithPeerWebRTCOptions overrides the WebRTC options used for both dialing and
-// listening.
+// listening. Note this replaces the whole options struct; to only add TURN
+// relays or force relay-only mode while keeping the peer defaults, prefer
+// WithPeerTURN / WithPeerForceRelay.
 func WithPeerWebRTCOptions(opts *WebRTCOptions) PeerOption {
 	return func(c *peerConfig) {
 		if opts != nil {
 			c.webrtc = opts
 		}
+	}
+}
+
+// WithPeerTURN adds one or more TURN relay servers to the peer's WebRTC
+// configuration without discarding the default STUN servers or other options.
+//
+//	p, _ := pipe.NewPeer("A", sig,
+//		pipe.WithPeerTURN(pipe.NewTURNServer(
+//			"turn:turn.example.com:3478?transport=udp", "user", "pass")),
+//	)
+func WithPeerTURN(servers ...TURNServer) PeerOption {
+	return func(c *peerConfig) {
+		if c.webrtc == nil {
+			c.webrtc = &WebRTCOptions{}
+		}
+		c.webrtc.TURNServers = append(c.webrtc.TURNServers, servers...)
+	}
+}
+
+// WithPeerForceRelay forces the peer to use only relay (TURN) candidates. The
+// connection fails rather than falling back to a direct path. Useful for
+// verifying that TURN relaying works end to end.
+func WithPeerForceRelay() PeerOption {
+	return func(c *peerConfig) {
+		if c.webrtc == nil {
+			c.webrtc = &WebRTCOptions{}
+		}
+		c.webrtc.ForceRelay = true
 	}
 }
 
@@ -192,6 +222,7 @@ func NewPeer(id string, sig signal.Signal, opts ...PeerOption) (*Peer, error) {
 	go p.acceptLoop()
 	go p.janitor()
 
+	slog.Info("peer created", "id", id, "idle_timeout", cfg.idleTimeout, "dial_timeout", cfg.dialTimeout)
 	return p, nil
 }
 
@@ -231,9 +262,10 @@ func (p *Peer) WriteTo(peerID string, b []byte) (int, error) {
 	var lastErr error
 	// Two attempts: the first may reuse a cached (possibly dead) session; on
 	// failure we evict it and the second attempt re-dials from scratch.
-	for range 2 {
+	for attempt := range 2 {
 		s, err := p.getOrDial(peerID)
 		if err != nil {
+			slog.Debug("peer write: getOrDial failed", "id", p.id, "remote", peerID, "attempt", attempt, "err", err)
 			return 0, err
 		}
 
@@ -246,10 +278,12 @@ func (p *Peer) WriteTo(peerID string, b []byte) (int, error) {
 			return len(b), nil
 		}
 
+		slog.Debug("peer write failed; evicting session and retrying", "id", p.id, "remote", peerID, "attempt", attempt, "err", werr)
 		lastErr = werr
 		p.evict(peerID, s)
 	}
 
+	slog.Warn("peer write failed after retries", "id", p.id, "remote", peerID, "err", lastErr)
 	return 0, lastErr
 }
 
@@ -332,16 +366,20 @@ func (p *Peer) handleInbound(conn *Conn) {
 	defer p.wg.Done()
 
 	if err := conn.WaitReady(p.ctx); err != nil {
+		slog.Debug("peer inbound conn never became ready", "id", p.id, "err", err)
 		p.closeConn(conn)
 		return
 	}
 
 	raw, err := readFrame(conn)
 	if err != nil || len(raw) == 0 {
+		slog.Debug("peer inbound handshake frame read failed", "id", p.id, "err", err, "len", len(raw))
 		p.closeConn(conn)
 		return
 	}
 	remoteID := string(raw)
+
+	slog.Info("peer inbound session established", "id", p.id, "remote", remoteID)
 
 	s := &peerSession{remoteID: remoteID, conn: conn}
 	s.touch()
@@ -361,6 +399,7 @@ func (p *Peer) readLoop(s *peerSession) {
 	for {
 		data, err := readFrame(s.conn)
 		if err != nil {
+			slog.Debug("peer read loop ended; evicting session", "id", p.id, "remote", s.remoteID, "err", err)
 			p.evict(s.remoteID, s)
 			return
 		}
@@ -417,8 +456,11 @@ func (p *Peer) dial(peerID string) (*peerSession, error) {
 	ctx, cancel := context.WithTimeout(p.ctx, p.cfg.dialTimeout)
 	defer cancel()
 
+	slog.Debug("peer dialing remote", "id", p.id, "remote", peerID)
+
 	conn, err := p.dialer.Dial(ctx, peerID)
 	if err != nil {
+		slog.Warn("peer dial failed", "id", p.id, "remote", peerID, "err", err)
 		return nil, err
 	}
 
@@ -447,6 +489,8 @@ func (p *Peer) dial(peerID string) (*peerSession, error) {
 		p.closeConn(conn)
 		return chosen, nil
 	}
+
+	slog.Info("peer outbound session established", "id", p.id, "remote", peerID)
 
 	p.wg.Add(1)
 	go func() {

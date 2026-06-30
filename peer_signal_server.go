@@ -1,6 +1,7 @@
 package pipe
 
 import (
+	"log/slog"
 	"net/http"
 	"sync"
 
@@ -43,6 +44,7 @@ func NewPeerSignalServer(opts ...sse.ServerOption) (*PeerSignalServer, error) {
 func (s *PeerSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	inbox, err := sse.ParseRequest(r)
 	if err != nil {
+		slog.WarnContext(r.Context(), "signal server received bad request", "method", r.Method, "raw_query", r.URL.RawQuery, "err", err)
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
@@ -51,10 +53,18 @@ func (s *PeerSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// uniqueness for the lifetime of that subscription.
 	if r.Method == http.MethodGet && inbox.IsMain() {
 		if !s.tryRegister(inbox.Id) {
+			// A second peer is trying to claim an id that is already online.
+			// Its Listener will never receive anything, so it appears to "never
+			// connect" — log it explicitly since it is an easy mistake to make.
+			slog.WarnContext(r.Context(), "rejected duplicate peer id registration", "peer_id", inbox.Id)
 			http.Error(w, "peer id already registered", http.StatusConflict)
 			return
 		}
-		defer s.unregister(inbox.Id)
+		slog.InfoContext(r.Context(), "peer registered on signal server", "peer_id", inbox.Id)
+		defer func() {
+			s.unregister(inbox.Id)
+			slog.InfoContext(r.Context(), "peer unregistered from signal server", "peer_id", inbox.Id)
+		}()
 	}
 
 	s.inner.ServeHTTP(w, r)
