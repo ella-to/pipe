@@ -1,26 +1,63 @@
+// Package turn provides an embeddable TURN server built on pion/turn v5.
+// It also answers STUN Binding requests on the same listeners.
+//
+// Features:
+//   - Static username/password authentication
+//   - Dynamic time-limited credentials (TURN REST API,
+//     draft-uberti-behave-turn-rest-00)
+//   - Per-user quotas: max concurrent allocations and max relay bandwidth
+//   - UDP, TCP and TLS (TURNS) listeners
+//   - Relay port range control
+//   - Peer permission filtering and allocation lifecycle events
+//
+// The zero value of Server is ready to use:
+//
+//	srv := &turn.Server{}
+//	err := srv.Start(turn.Config{
+//		ListenAddr: ":3478",
+//		PublicIP:   "203.0.113.10",
+//		Users:      []turn.User{{Username: "alice", Password: "secret"}},
+//	})
+//
+// See turn/examples for runnable examples from simple to advanced.
 package turn
 
 import (
-	"crypto/hmac"
-	"crypto/sha1"
 	"crypto/tls"
-	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"time"
 
-	"github.com/pion/turn/v4"
+	"github.com/pion/turn/v5"
 	"github.com/pion/webrtc/v4"
 )
 
-// Server is a TURN server using pion/turn.
-// It also handles STUN Binding requests on the same port.
-type Server struct {
-	cfg  Config
-	pc   net.PacketConn
-	tcpL net.Listener
-	tlsL net.Listener
-	srv  *turn.Server
+// Aliases to pion/turn v5 types so advanced callers don't need to import
+// pion/turn directly.
+type (
+	// AuthHandler authenticates a TURN request. It returns the user id used
+	// for quota accounting and events, the MD5 long-term credential key
+	// (see GenerateAuthKey), and whether authentication succeeded.
+	AuthHandler = turn.AuthHandler
+
+	// RequestAttributes carries the attributes of the request being
+	// authenticated (username, realm, source address, TLS state, method).
+	RequestAttributes = turn.RequestAttributes
+
+	// PermissionHandler filters CreatePermission / ChannelBind requests.
+	// Return false to block the client (clientAddr) from reaching peerIP.
+	PermissionHandler = turn.PermissionHandler
+
+	// EventHandler is a set of optional callbacks fired at allocation
+	// lifecycle hook points (created, deleted, permissions, channels, auth).
+	EventHandler = turn.EventHandler
+)
+
+// GenerateAuthKey produces the long-term credential key stored/returned by an
+// AuthHandler: MD5(username:realm:password).
+func GenerateAuthKey(username, realm, password string) []byte {
+	return turn.GenerateAuthKey(username, realm, password)
 }
 
 // User represents static auth credentials.
@@ -30,42 +67,70 @@ type User struct {
 }
 
 // Config controls the TURN server.
-//
-// ListenAddr is the local UDP address to bind, e.g. ":3478".
-// PublicIP is the external/public IP address that peers will use to reach relays.
-// RelayMinPort/RelayMaxPort control the relay port range.
-// Realm is the authentication realm.
-// Users is a static list of username/password pairs (long-term credential).
 type Config struct {
-	// UDP listener (TURN over UDP)
+	// ListenAddr is the local UDP address to bind, e.g. ":3478".
+	// Defaults to ":3478".
 	ListenAddr string
 
-	// TCP/TLS listeners (optional)
+	// TCPListenAddr and TLSListenAddr optionally enable TURN over TCP and
+	// TURNS (TLS) listeners.
 	TCPListenAddr string
 	TLSListenAddr string
 
-	// TLS configuration (either provide Cert/Key files or TLSConfig)
+	// TLS configuration for TLSListenAddr: either provide Cert/Key files or
+	// a complete TLSConfig.
 	TLSCertFile string
 	TLSKeyFile  string
 	TLSConfig   *tls.Config
 
-	// Public relay settings
-	PublicIP     string
-	RelayMinPort uint16 // optional; if zero, default system range is used
-	RelayMaxPort uint16 // optional; if zero, default system range is used
-	Realm        string
-	Users        []User // static users
+	// PublicIP is the external IP address peers use to reach relays.
+	// Required.
+	PublicIP string
 
-	// Dynamic (REST) credentials
+	// RelayMinPort/RelayMaxPort restrict the ports used for relay
+	// allocations. If both are zero the system's ephemeral range is used.
+	RelayMinPort uint16
+	RelayMaxPort uint16
+
+	// Realm is the authentication realm. Defaults to "ella.to".
+	Realm string
+
+	// Users is a static list of username/password pairs.
+	Users []User
+
+	// Dynamic enables time-limited credentials alongside (or instead of)
+	// static Users.
 	Dynamic *DynamicAuth
+
+	// AuthHandler, when set, fully replaces the built-in authentication
+	// (Users and Dynamic are ignored).
+	AuthHandler AuthHandler
+
+	// Quota enforces per-user allocation and bandwidth limits.
+	Quota *Quota
+
+	// PermissionHandler, when set, filters which peer IPs a client may
+	// relay to. Defaults to allowing everything.
+	PermissionHandler PermissionHandler
+
+	// Events receives allocation lifecycle callbacks. All fields are
+	// optional.
+	Events EventHandler
+
+	// Lifetimes. Zero values use pion/turn defaults (10 minutes each).
+	AllocationLifetime time.Duration
+	PermissionTimeout  time.Duration
+	ChannelBindTimeout time.Duration
 }
 
-// DynamicAuth enables time-limited credentials.
-// Username is an expiry epoch (seconds), credential is base64(HMAC-SHA1(secret, username)).
-// Requests are accepted if not expired and within MaxTTL.
-type DynamicAuth struct {
-	Secret string
-	MaxTTL time.Duration
+// Server is a TURN server using pion/turn.
+type Server struct {
+	cfg   Config
+	pc    net.PacketConn
+	tcpL  net.Listener
+	tlsL  net.Listener
+	srv   *turn.Server
+	quota *quotaTracker
 }
 
 // Start launches the TURN server.
@@ -76,128 +141,94 @@ func (s *Server) Start(cfg Config) error {
 	if cfg.Realm == "" {
 		cfg.Realm = "ella.to"
 	}
-	// Optional port range; if left zero, the generator will use system defaults
+
+	relayIP := net.ParseIP(cfg.PublicIP)
+	if relayIP == nil {
+		return fmt.Errorf("turn: invalid PublicIP %q", cfg.PublicIP)
+	}
 
 	s.cfg = cfg
+	s.quota = newQuotaTracker()
+
+	relayGen := s.buildRelayGenerator(relayIP)
+
 	var (
 		packetConns []turn.PacketConnConfig
 		listeners   []turn.ListenerConfig
 	)
 
 	// UDP
-	if cfg.ListenAddr != "" {
-		pc, err := net.ListenPacket("udp4", cfg.ListenAddr)
-		if err != nil {
-			return err
-		}
-		s.pc = pc
-		// Persist actual addr (handles :0)
-		s.cfg.ListenAddr = pc.LocalAddr().String()
-		// Configure relay address generator for UDP as well
-		// (relayGen is defined below)
-		// We'll append after relayGen is constructed.
-		packetConns = append(packetConns, turn.PacketConnConfig{PacketConn: pc})
+	pc, err := net.ListenPacket("udp4", cfg.ListenAddr)
+	if err != nil {
+		return err
 	}
-
-	// Build a map for quick lookup in AuthHandler
-	userPass := map[string]string{}
-	for _, u := range cfg.Users {
-		userPass[u.Username] = u.Password
-	}
-
-	relayGen := &turn.RelayAddressGeneratorStatic{
-		RelayAddress: net.ParseIP(cfg.PublicIP),
-		Address:      "0.0.0.0",
-		// Port range omitted; defaults in the library will be used
-	}
+	s.pc = pc
+	// Persist actual addr (handles :0)
+	s.cfg.ListenAddr = pc.LocalAddr().String()
+	packetConns = append(packetConns, turn.PacketConnConfig{
+		PacketConn:            pc,
+		RelayAddressGenerator: relayGen,
+		PermissionHandler:     cfg.PermissionHandler,
+	})
 
 	// TCP
 	if cfg.TCPListenAddr != "" {
 		tl, err := net.Listen("tcp", cfg.TCPListenAddr)
 		if err != nil {
-			if s.pc != nil {
-				_ = s.pc.Close()
-			}
+			s.closeListeners()
 			return err
 		}
 		s.tcpL = tl
 		s.cfg.TCPListenAddr = tl.Addr().String()
-		listeners = append(listeners, turn.ListenerConfig{Listener: tl, RelayAddressGenerator: relayGen})
+		listeners = append(listeners, turn.ListenerConfig{
+			Listener:              tl,
+			RelayAddressGenerator: relayGen,
+			PermissionHandler:     cfg.PermissionHandler,
+		})
 	}
 
 	// TLS (TURNS)
 	if cfg.TLSListenAddr != "" {
-		var tconf *tls.Config
-		if cfg.TLSConfig != nil {
-			tconf = cfg.TLSConfig
-		} else if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		tconf := cfg.TLSConfig
+		if tconf == nil && cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
 			cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
 			if err != nil {
-				if s.pc != nil {
-					_ = s.pc.Close()
-				}
-				if s.tcpL != nil {
-					_ = s.tcpL.Close()
-				}
+				s.closeListeners()
 				return err
 			}
 			tconf = &tls.Config{Certificates: []tls.Certificate{cert}}
 		}
-		if tconf != nil {
-			tl, err := tls.Listen("tcp", cfg.TLSListenAddr, tconf)
-			if err != nil {
-				if s.pc != nil {
-					_ = s.pc.Close()
-				}
-				if s.tcpL != nil {
-					_ = s.tcpL.Close()
-				}
-				return err
-			}
-			s.tlsL = tl
-			s.cfg.TLSListenAddr = tl.Addr().String()
-			listeners = append(listeners, turn.ListenerConfig{Listener: tl, RelayAddressGenerator: relayGen})
+		if tconf == nil {
+			s.closeListeners()
+			return errors.New("turn: TLSListenAddr set but no TLS certificate provided")
 		}
-	}
-
-	// attach relay generator to UDP PacketConn entries
-	if len(packetConns) > 0 {
-		for i := range packetConns {
-			packetConns[i].RelayAddressGenerator = relayGen
+		tl, err := tls.Listen("tcp", cfg.TLSListenAddr, tconf)
+		if err != nil {
+			s.closeListeners()
+			return err
 		}
+		s.tlsL = tl
+		s.cfg.TLSListenAddr = tl.Addr().String()
+		listeners = append(listeners, turn.ListenerConfig{
+			Listener:              tl,
+			RelayAddressGenerator: relayGen,
+			PermissionHandler:     cfg.PermissionHandler,
+		})
 	}
 
 	srv, err := turn.NewServer(turn.ServerConfig{
-		Realm: cfg.Realm,
-		AuthHandler: func(username, realm string, srcAddr net.Addr) ([]byte, bool) {
-			// Dynamic credentials first
-			if cfg.Dynamic != nil && cfg.Dynamic.Secret != "" && cfg.Dynamic.MaxTTL > 0 {
-				if valid, pass := s.validateDynamic(username, cfg.Dynamic); valid {
-					key := turn.GenerateAuthKey(username, realm, pass)
-					return key, true
-				}
-			}
-			// Static users
-			pass, ok := userPass[username]
-			if ok {
-				key := turn.GenerateAuthKey(username, realm, pass)
-				return key, true
-			}
-			return nil, false
-		},
-		PacketConnConfigs: packetConns,
-		ListenerConfigs:   listeners,
+		Realm:              cfg.Realm,
+		AuthHandler:        s.buildAuthHandler(),
+		QuotaHandler:       s.buildQuotaHandler(),
+		EventHandler:       s.buildEventHandler(),
+		PacketConnConfigs:  packetConns,
+		ListenerConfigs:    listeners,
+		AllocationLifetime: cfg.AllocationLifetime,
+		PermissionTimeout:  cfg.PermissionTimeout,
+		ChannelBindTimeout: cfg.ChannelBindTimeout,
 	})
 	if err != nil {
-		if s.pc != nil {
-			_ = s.pc.Close()
-		}
-		if s.tcpL != nil {
-			_ = s.tcpL.Close()
-		}
-		if s.tlsL != nil {
-			_ = s.tlsL.Close()
-		}
+		s.closeListeners()
 		return err
 	}
 
@@ -207,20 +238,23 @@ func (s *Server) Start(cfg Config) error {
 
 // Close stops the TURN server.
 func (s *Server) Close() error {
-	var srvErr error
 	if s.srv != nil {
-		srvErr = s.srv.Close()
+		err := s.srv.Close()
 		s.srv = nil
 		// pion/turn closes the PacketConn and listeners
 		s.pc = nil
 		s.tcpL = nil
 		s.tlsL = nil
-		return srvErr
+		return err
 	}
 	// Fallback cleanup if srv was never created
-	var err error
+	s.closeListeners()
+	return nil
+}
+
+func (s *Server) closeListeners() {
 	if s.pc != nil {
-		err = s.pc.Close()
+		_ = s.pc.Close()
 		s.pc = nil
 	}
 	if s.tcpL != nil {
@@ -231,17 +265,116 @@ func (s *Server) Close() error {
 		_ = s.tlsL.Close()
 		s.tlsL = nil
 	}
-	return err
 }
 
-// ICEServer returns a webrtc.ICEServer for a given static user.
-// The PublicAddr should be the externally reachable host:port, i.e., PublicIP:port.
+func (s *Server) buildRelayGenerator(relayIP net.IP) turn.RelayAddressGenerator {
+	var gen turn.RelayAddressGenerator
+	if s.cfg.RelayMinPort != 0 || s.cfg.RelayMaxPort != 0 {
+		gen = &turn.RelayAddressGeneratorPortRange{
+			RelayAddress: relayIP,
+			Address:      "0.0.0.0",
+			MinPort:      s.cfg.RelayMinPort,
+			MaxPort:      s.cfg.RelayMaxPort,
+		}
+	} else {
+		gen = &turn.RelayAddressGeneratorStatic{
+			RelayAddress: relayIP,
+			Address:      "0.0.0.0",
+		}
+	}
+	if s.cfg.Quota.hasBandwidthLimit() {
+		gen = &bandwidthLimitedGenerator{
+			RelayAddressGenerator: gen,
+			quota:                 s.cfg.Quota,
+			tracker:               s.quota,
+		}
+	}
+	return gen
+}
+
+func (s *Server) buildEventHandler() EventHandler {
+	events := s.cfg.Events
+	handler := events
+	handler.OnAllocationCreated = func(srcAddr, dstAddr net.Addr, protocol, userID, realm string,
+		relayAddr net.Addr, requestedPort int,
+	) {
+		s.quota.inc(userID)
+		if events.OnAllocationCreated != nil {
+			events.OnAllocationCreated(srcAddr, dstAddr, protocol, userID, realm, relayAddr, requestedPort)
+		}
+	}
+	handler.OnAllocationDeleted = func(srcAddr, dstAddr net.Addr, protocol, userID, realm string) {
+		s.quota.dec(userID)
+		if events.OnAllocationDeleted != nil {
+			events.OnAllocationDeleted(srcAddr, dstAddr, protocol, userID, realm)
+		}
+	}
+	return handler
+}
+
+func (s *Server) buildQuotaHandler() turn.QuotaHandler {
+	quota := s.cfg.Quota
+	if quota == nil {
+		return nil
+	}
+	return func(userID, realm string, srcAddr net.Addr) bool {
+		max := quota.forUser(userID).MaxAllocations
+		if max <= 0 {
+			return true
+		}
+		return s.quota.count(userID) < max
+	}
+}
+
+// ActiveAllocations returns the number of live allocations for a user id.
+// For static users the user id is the username; for dynamic credentials
+// created with GenerateCredentials it is the userID argument.
+func (s *Server) ActiveAllocations(userID string) int {
+	return s.quota.count(userID)
+}
+
+// TotalAllocations returns the number of live allocations across all users.
+func (s *Server) TotalAllocations() int {
+	return s.quota.total()
+}
+
+// URLs returns the TURN URLs (turn:/turns:) that clients should use,
+// derived from the configured listeners and PublicIP.
+func (s *Server) URLs() []string {
+	urls := []string{}
+	if addr := s.listenAddrToPublic(s.cfg.ListenAddr); addr != "" {
+		urls = append(urls, fmt.Sprintf("turn:%s?transport=udp", addr))
+	}
+	if addr := s.listenAddrToPublic(s.cfg.TCPListenAddr); addr != "" {
+		urls = append(urls, fmt.Sprintf("turn:%s?transport=tcp", addr))
+	}
+	if addr := s.listenAddrToPublic(s.cfg.TLSListenAddr); addr != "" {
+		urls = append(urls, fmt.Sprintf("turns:%s?transport=tcp", addr))
+	}
+	return urls
+}
+
+// ICEServerFor returns a webrtc.ICEServer for a given static user.
 func (s *Server) ICEServerFor(username string) webrtc.ICEServer {
 	return webrtc.ICEServer{
-		URLs:       s.turnURLs(),
+		URLs:       s.URLs(),
 		Username:   username,
 		Credential: s.passwordFor(username),
 	}
+}
+
+// ICEServerForDynamic returns a webrtc.ICEServer with freshly generated
+// time-limited credentials for the given user id. Requires Config.Dynamic.
+func (s *Server) ICEServerForDynamic(userID string, ttl time.Duration) (webrtc.ICEServer, error) {
+	username, credential, err := s.GenerateCredentials(userID, ttl)
+	if err != nil {
+		return webrtc.ICEServer{}, err
+	}
+	return webrtc.ICEServer{
+		URLs:       s.URLs(),
+		Username:   username,
+		Credential: credential,
+	}, nil
 }
 
 func (s *Server) passwordFor(username string) string {
@@ -253,8 +386,8 @@ func (s *Server) passwordFor(username string) string {
 	return ""
 }
 
-// ListenAddrToPublic returns the public host:port to use in ICE URLs.
-// If ListenAddr is host:port and PublicIP is set, this returns PublicIP:port.
+// listenAddrToPublic returns the public host:port to use in ICE URLs.
+// If listenAddr is host:port and PublicIP is set, this returns PublicIP:port.
 func (s *Server) listenAddrToPublic(listenAddr string) string {
 	if listenAddr == "" {
 		return ""
@@ -267,60 +400,4 @@ func (s *Server) listenAddrToPublic(listenAddr string) string {
 		return listenAddr
 	}
 	return net.JoinHostPort(s.cfg.PublicIP, port)
-}
-
-func (s *Server) turnURLs() []string {
-	urls := []string{}
-	if s.pc != nil || s.cfg.ListenAddr != "" {
-		if addr := s.listenAddrToPublic(s.cfg.ListenAddr); addr != "" {
-			urls = append(urls, fmt.Sprintf("turn:%s?transport=udp", addr))
-		}
-	}
-	if s.tcpL != nil || s.cfg.TCPListenAddr != "" {
-		if addr := s.listenAddrToPublic(s.cfg.TCPListenAddr); addr != "" {
-			urls = append(urls, fmt.Sprintf("turn:%s?transport=tcp", addr))
-		}
-	}
-	if s.tlsL != nil || s.cfg.TLSListenAddr != "" {
-		if addr := s.listenAddrToPublic(s.cfg.TLSListenAddr); addr != "" {
-			urls = append(urls, fmt.Sprintf("turns:%s?transport=tcp", addr))
-		}
-	}
-	return urls
-}
-
-func (s *Server) validateDynamic(username string, d *DynamicAuth) (bool, string) {
-	if d == nil || d.Secret == "" || d.MaxTTL <= 0 {
-		return false, ""
-	}
-	// Parse expiry as integer seconds
-	var exp int64
-	for i := 0; i < len(username); i++ {
-		ch := username[i]
-		if ch < '0' || ch > '9' {
-			return false, ""
-		}
-		exp = exp*10 + int64(ch-'0')
-	}
-	now := time.Now().Unix()
-	if exp < now || exp-now > int64(d.MaxTTL.Seconds()) {
-		return false, ""
-	}
-	mac := hmac.New(sha1.New, []byte(d.Secret))
-	_, _ = mac.Write([]byte(username))
-	pass := base64.StdEncoding.EncodeToString(mac.Sum(nil))
-	return true, pass
-}
-
-// GenerateRESTCredentials returns (username, credential) for time-limited TURN auth.
-func (s *Server) GenerateRESTCredentials(ttl time.Duration) (string, string) {
-	if s.cfg.Dynamic == nil || s.cfg.Dynamic.Secret == "" {
-		return "", ""
-	}
-	exp := time.Now().Add(ttl).Unix()
-	uname := fmt.Sprintf("%d", exp)
-	mac := hmac.New(sha1.New, []byte(s.cfg.Dynamic.Secret))
-	_, _ = mac.Write([]byte(uname))
-	cred := base64.StdEncoding.EncodeToString(mac.Sum(nil))
-	return uname, cred
 }

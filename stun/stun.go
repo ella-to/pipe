@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/pion/turn/v4"
+	"github.com/pion/turn/v5"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -47,7 +47,7 @@ func (s *Server) Start(cfg Config) error {
 	srv, err := turn.NewServer(turn.ServerConfig{
 		// STUN Binding requests do not require auth; TURN allocations aren't supported here
 		Realm:       "stun",
-		AuthHandler: func(username, realm string, srcAddr net.Addr) ([]byte, bool) { return nil, false },
+		AuthHandler: func(*turn.RequestAttributes) (string, []byte, bool) { return "", nil, false },
 		PacketConnConfigs: []turn.PacketConnConfig{
 			{
 				PacketConn: pc,

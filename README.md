@@ -26,8 +26,9 @@
 - **`io.ReadWriteCloser` interface**: Use familiar patterns for reading/writing data
 - **`Peer` overlay**: String-addressed, many-to-many datagram messaging (`net.PacketConn`-style `WriteTo`/`ReadFrom`) with on-demand dialing, idle eviction, and automatic reconnect
 - **Pluggable signaling**: Bring your own signaling mechanism (SSE, WebSocket, etc.)
-- **Built-in STUN/TURN servers**: Optional packages for self-hosted ICE infrastructure
+- **Built-in STUN/TURN servers**: Optional packages for self-hosted ICE infrastructure (pion/turn v5)
 - **Dynamic credentials**: Time-limited TURN authentication (REST API style)
+- **Per-user TURN quotas**: Limit concurrent allocations and relay bandwidth per user
 - **NAT traversal**: Configurable ICE servers and NAT 1:1 IP mapping
 
 ## Installation
@@ -583,6 +584,13 @@ iceServer := server.ICEServer()
 
 ## Self-Hosted TURN Server
 
+The `turn` package is an embeddable TURN server built on
+[pion/turn v5](https://github.com/pion/turn). It supports static and dynamic
+(time-limited) authentication, per-user allocation and bandwidth quotas,
+UDP/TCP/TLS listeners, peer permission filtering, and allocation lifecycle
+events. See [turn/examples](turn/examples) for runnable examples from simple
+to advanced.
+
 ### Basic TURN Server
 
 ```go
@@ -591,7 +599,7 @@ import "ella.to/pipe/turn"
 server := &turn.Server{}
 err := server.Start(turn.Config{
     ListenAddr: ":3478",        // UDP
-    PublicIP:   "203.0.113.10", // Your server's public IP
+    PublicIP:   "203.0.113.10", // Your server's public IP (required)
     Realm:      "example.com",
     Users: []turn.User{
         {Username: "alice", Password: "secret123"},
@@ -603,7 +611,10 @@ if err != nil {
 }
 defer server.Close()
 
-// Get ICE server for a specific user
+// TURN URLs derived from the enabled listeners and PublicIP
+urls := server.URLs()
+
+// Get ICE server for a specific static user
 iceServer := server.ICEServerFor("alice")
 ```
 
@@ -627,7 +638,10 @@ err := server.Start(turn.Config{
 
 ### Dynamic (REST) Credentials
 
-Time-limited credentials using HMAC-SHA1 (compatible with standard TURN REST API):
+Time-limited credentials using HMAC-SHA1, compatible with the standard TURN
+REST API (draft-uberti-behave-turn-rest-00). No passwords are stored or
+distributed; the server and the credential issuer share a secret and
+credentials expire on their own:
 
 ```go
 server := &turn.Server{}
@@ -637,20 +651,107 @@ err := server.Start(turn.Config{
     Realm:      "example.com",
     Dynamic: &turn.DynamicAuth{
         Secret: "your-shared-secret",
-        MaxTTL: 24 * time.Hour,
+        MaxTTL: 24 * time.Hour, // reject credentials claiming to live longer
     },
 })
 
-// Generate credentials for a client (valid for 1 hour)
-username, credential := server.GenerateRESTCredentials(1 * time.Hour)
+// Generate credentials bound to a user id (valid for 1 hour).
+// The username is "<expiry>:<userID>"; quotas and events are keyed on userID,
+// so limits survive credential rotation.
+username, credential, err := server.GenerateCredentials("alice", 1*time.Hour)
+
+// Or get a ready-to-use webrtc.ICEServer in one call
+iceServer, err := server.ICEServerForDynamic("alice", 1*time.Hour)
 
 // Client uses these credentials
-iceServer := webrtc.ICEServer{
-    URLs:       []string{"turn:turn.example.com:3478"},
-    Username:   username,   // Unix timestamp of expiry
-    Credential: credential, // HMAC-SHA1(secret, username)
+ice := webrtc.ICEServer{
+    URLs:       server.URLs(),
+    Username:   username,   // "<expiry unix ts>:alice"
+    Credential: credential, // base64(HMAC-SHA1(secret, username))
 }
 ```
+
+`GenerateRESTCredentials(ttl)` is still available for the plain `"<expiry>"`
+username format without a user id.
+
+### Per-User Quotas
+
+Limit concurrent allocations (sessions) and relay bandwidth per user. When
+the allocation limit is hit the client receives a standard 486 (Allocation
+Quota Reached) error; traffic over the bandwidth budget is dropped like a
+congested link:
+
+```go
+server := &turn.Server{}
+err := server.Start(turn.Config{
+    ListenAddr: ":3478",
+    PublicIP:   "203.0.113.10",
+    Users:      []turn.User{{Username: "alice", Password: "secret"}},
+    Quota: &turn.Quota{
+        // Applies to every user without a PerUser entry
+        Default: turn.UserQuota{
+            MaxAllocations:    2,             // concurrent sessions
+            MaxBytesPerSecond: 1_000_000 / 8, // 1 Mbps up+down combined
+        },
+        // Per-user overrides (fully replace Default; zero = unlimited)
+        PerUser: map[string]turn.UserQuota{
+            "premium": {MaxAllocations: 10, MaxBytesPerSecond: 10_000_000 / 8},
+        },
+        // Or resolve quotas dynamically (e.g. from your DB); called
+        // concurrently, takes precedence when it returns true
+        Lookup: func(userID string) (turn.UserQuota, bool) {
+            return turn.UserQuota{}, false
+        },
+    },
+})
+
+// Live usage introspection
+n := server.ActiveAllocations("alice")
+total := server.TotalAllocations()
+```
+
+Users are identified by the authenticated user id: the username for static
+users, the `userID` part of `"<expiry>:<userID>"` for dynamic credentials.
+
+### Permission Filtering and Lifecycle Events
+
+```go
+err := server.Start(turn.Config{
+    // ...
+    // Decide which peer IPs a client may relay to, e.g. keep a public
+    // relay from reaching into your private network:
+    PermissionHandler: func(clientAddr net.Addr, peerIP net.IP) bool {
+        return !peerIP.IsPrivate() && !peerIP.IsLoopback()
+    },
+    // Observe allocations for logging/metrics (all callbacks optional):
+    Events: turn.EventHandler{
+        OnAllocationCreated: func(src, dst net.Addr, proto, userID, realm string, relay net.Addr, port int) {
+            log.Printf("allocation created: user=%s relay=%s", userID, relay)
+        },
+        OnAllocationDeleted: func(src, dst net.Addr, proto, userID, realm string) {
+            log.Printf("allocation deleted: user=%s", userID)
+        },
+    },
+    // Restrict relay ports for easy firewalling (open 50000-55000/udp):
+    RelayMinPort: 50000,
+    RelayMaxPort: 55000,
+})
+```
+
+For full control, `Config.AuthHandler` replaces the built-in authentication
+entirely, and `turn.GenerateAuthKey` produces keys in the expected format.
+
+### TURN Server Examples
+
+Runnable examples live in [turn/examples](turn/examples):
+
+| Example | What it shows |
+|---|---|
+| [01-simple](turn/examples/01-simple/main.go) | Minimal server with static users over UDP |
+| [02-tcp-tls](turn/examples/02-tcp-tls/main.go) | UDP + TCP + TLS (TURNS) listeners |
+| [03-dynamic-credentials](turn/examples/03-dynamic-credentials/main.go) | Time-limited credentials with an HTTP issuer endpoint |
+| [04-quota](turn/examples/04-quota/main.go) | Allocation + bandwidth quotas with per-user overrides |
+| [05-advanced](turn/examples/05-advanced/main.go) | Production-style: dynamic credentials, tiered quotas, permission filtering, metrics, port range, graceful shutdown |
 
 ## Best Practices
 
