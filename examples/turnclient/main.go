@@ -13,14 +13,24 @@
 //
 //	go run ./examples/turnclient -rate 512KiB -bytes 4MiB
 //
+// Compare two plans on the embedded relay, which is the free-versus-paid setup
+// the guides describe. The plan is chosen by the "@plan" suffix of the user ID:
+//
+//	go run ./examples/turnclient -plans 'free=512KiB,paid=8MiB' -user alice@free -bytes 2MiB
+//	go run ./examples/turnclient -plans 'free=512KiB,paid=8MiB' -user alice@paid -bytes 2MiB
+//
 // Point it at a server you started separately — `go run ./examples/turnserver`,
 // or coturn, or a cloud TURN service — with the URL and credentials:
 //
 //	go run ./examples/turnclient -embedded=false \
 //		-turn 'turn:127.0.0.1:3478?transport=udp' -user admin -pass admin
 //
-// Credentials are read from TUNNEL_TURN_USERNAME and TUNNEL_TURN_PASSWORD when
-// the flags are empty, which is how they should reach a real deployment.
+// With -auth-secret the client mints ephemeral credentials for -user instead of
+// using -pass, against an embedded server that verifies them the way a
+// production relay with a shared secret would.
+//
+// Credentials are read from PIPE_TURN_USERNAME and PIPE_TURN_PASSWORD when the
+// flags are empty, which is how they should reach a real deployment.
 //
 // Two things are worth noticing in the output. The candidate types report
 // `relay/relay`, which is proof the bytes went through TURN rather than finding
@@ -64,13 +74,16 @@ func main() {
 	embedded := flag.Bool("embedded", true, "run a STUN and TURN server in this process")
 	turnURL := flag.String("turn", "", "TURN URL, e.g. turn:203.0.113.10:3478?transport=udp")
 	stunURL := flag.String("stun", "", "optional STUN URL")
-	user := flag.String("user", "admin", "TURN username (or set TUNNEL_TURN_USERNAME)")
-	pass := flag.String("pass", "admin", "TURN password (or set TUNNEL_TURN_PASSWORD)")
+	user := flag.String("user", "admin", "TURN username, or user ID with -auth-secret (or set PIPE_TURN_USERNAME)")
+	pass := flag.String("pass", "admin", "TURN password (or set PIPE_TURN_PASSWORD)")
+	secret := flag.String("auth-secret", "",
+		"mint ephemeral credentials for -user with this shared secret instead of using -pass")
 	realm := flag.String("realm", turnx.DefaultRealm, "TURN realm; must match the server")
 	relayOnly := flag.Bool("relay-only", true, "gather relay candidates only, so TURN cannot be bypassed")
 	sizeSpec := flag.String("bytes", "4MiB", "how much data to transfer")
-	rateSpec := flag.String("rate", "0", "relay throughput budget for -embedded, e.g. 512KiB; 0 is unlimited")
+	rateSpec := flag.String("rate", "0", "default relay budget for -embedded, e.g. 512KiB; 0 is unlimited")
 	burstSpec := flag.String("burst", "0", "token bucket depth for -embedded; 0 derives it from -rate")
+	plans := flag.String("plans", "", "named plans for -embedded, e.g. free=512KiB,paid=8MiB; select one with -user name@plan")
 	maxDelay := flag.Duration("max-delay", turnx.DefaultMaxDelay,
 		"how long -embedded may hold a relayed packet for budget before dropping it")
 	verbose := flag.Bool("v", false, "log debug detail")
@@ -80,13 +93,15 @@ func main() {
 		embedded:  *embedded,
 		turnURL:   *turnURL,
 		stunURL:   *stunURL,
-		user:      envOr("TUNNEL_TURN_USERNAME", *user),
-		pass:      envOr("TUNNEL_TURN_PASSWORD", *pass),
+		user:      envOr("PIPE_TURN_USERNAME", *user),
+		pass:      envOr("PIPE_TURN_PASSWORD", *pass),
+		secret:    *secret,
 		realm:     *realm,
 		relayOnly: *relayOnly,
 		sizeSpec:  *sizeSpec,
 		rateSpec:  *rateSpec,
 		burstSpec: *burstSpec,
+		plans:     *plans,
 		maxDelay:  *maxDelay,
 		verbose:   *verbose,
 	}
@@ -103,11 +118,13 @@ type options struct {
 	stunURL   string
 	user      string
 	pass      string
+	secret    string
 	realm     string
 	relayOnly bool
 	sizeSpec  string
 	rateSpec  string
 	burstSpec string
+	plans     string
 	maxDelay  time.Duration
 	verbose   bool
 }
@@ -134,6 +151,10 @@ func run(opts options) error {
 	if err != nil {
 		return err
 	}
+	plans, err := turnx.ParsePlans(opts.plans)
+	if err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -141,14 +162,18 @@ func run(opts options) error {
 	// Either run the relay here or use the one the caller pointed us at.
 	var relay *turnx.Server
 	if opts.embedded {
+		users := map[string]turnx.User{}
+		if opts.secret == "" {
+			users[opts.user] = turnx.User{Password: opts.pass}
+		}
 		relay, err = turnx.Start(turnx.Config{
-			Listen:   "127.0.0.1:0",
-			Realm:    opts.realm,
-			Users:    map[string]string{opts.user: opts.pass},
-			Rate:     rateBytes,
-			Burst:    burst,
-			MaxDelay: opts.maxDelay,
-			Logger:   log,
+			Listen:      "127.0.0.1:0",
+			Realm:       opts.realm,
+			Users:       users,
+			AuthSecret:  opts.secret,
+			Plans:       plans,
+			DefaultPlan: turnx.Plan{Rate: rateBytes, Burst: burst, MaxDelay: opts.maxDelay},
+			Logger:      log,
 		})
 		if err != nil {
 			return err
@@ -164,12 +189,22 @@ func run(opts options) error {
 		return errors.New("either -embedded or -turn is required")
 	}
 
+	// With a shared secret the credential is minted here, exactly as a service
+	// would mint it for a signed-in user, and expires on its own.
+	username, credential := opts.user, opts.pass
+	if opts.secret != "" {
+		username, credential, err = turnx.IssueCredentials(opts.secret, opts.user, time.Hour)
+		if err != nil {
+			return err
+		}
+	}
+
 	iceServers := []pipe.ICEServer{{
 		URLs:     []string{opts.turnURL},
-		Username: opts.user,
+		Username: username,
 		// The credential is a long-term TURN password. It is never logged, and
 		// pipe never puts it in an error or a metric label.
-		Credential:     opts.pass,
+		Credential:     credential,
 		CredentialType: pipe.ICECredentialPassword,
 	}}
 	if opts.stunURL != "" {
@@ -189,9 +224,15 @@ func run(opts options) error {
 		fmt.Printf("stun:        %s\n", opts.stunURL)
 	}
 	fmt.Printf("user:        %s (realm %s)\n", opts.user, opts.realm)
+	if opts.secret != "" {
+		fmt.Printf("credential:  ephemeral, expires in 1h\n")
+	}
 	fmt.Printf("policy:      %s\n", policy)
 	if opts.embedded {
 		fmt.Printf("relay rate:  %s\n", rateLabel(rateBytes))
+		for name, plan := range plans {
+			fmt.Printf("plan %-7s %s\n", name+":", plan)
+		}
 	}
 	fmt.Printf("transfer:    %s (echoed, so every byte crosses the relay four times)\n\n",
 		turnx.FormatSize(size))
@@ -255,7 +296,11 @@ func run(opts options) error {
 	report(conn)
 
 	if relay != nil {
-		fmt.Printf("\nrelay        %s\n", relay.Stats())
+		st := relay.Stats()
+		fmt.Printf("\nrelay        %s\n", st)
+		for _, id := range turnx.SortedUsers(st) {
+			fmt.Printf("user %-8s %s\n", id, st.Users[id])
+		}
 	}
 
 	if err := conn.Close(); err != nil {

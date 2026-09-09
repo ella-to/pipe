@@ -833,3 +833,100 @@ func TestKeepAlive(t *testing.T) {
 	}
 	t.Fatal("no keepalive round trip was recorded")
 }
+
+func TestAllowPeer(t *testing.T) {
+	testutil.CheckLeaks(t)
+
+	hub := memory.New()
+	alice := newEndpoint(t, hub, "alice", nil)
+	mallory := newEndpoint(t, hub, "mallory", nil)
+	bob := newEndpoint(t, hub, "bob", func(cfg *pipe.Config) {
+		cfg.AllowPeer = func(peer pipe.PeerID) bool { return peer == "alice" }
+	})
+
+	ln, err := bob.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	// The unlisted peer is refused before any PeerConnection exists, with a
+	// code that names the reason.
+	_, err = mallory.Dial(ctx, "bob")
+	if !errors.Is(err, pipe.ErrPeerRejected) {
+		t.Fatalf("mallory: error = %v, want ErrPeerRejected", err)
+	}
+	var rejected *pipe.RejectedError
+	if !errors.As(err, &rejected) || rejected.Code != pipe.RejectUnauthorized {
+		t.Fatalf("mallory: error = %v, want code %q", err, pipe.RejectUnauthorized)
+	}
+
+	// The listed peer connects normally, and the listener hands back the
+	// concrete type without a type assertion.
+	accepted := make(chan *pipe.Conn, 1)
+	go func() {
+		c, err := ln.AcceptConn()
+		if err == nil {
+			accepted <- c
+		}
+	}()
+	client, err := alice.Dial(ctx, "bob")
+	if err != nil {
+		t.Fatalf("alice: dial: %v", err)
+	}
+	defer client.Close()
+
+	select {
+	case server := <-accepted:
+		defer server.Close()
+		if server.PeerID() != "alice" {
+			t.Errorf("accepted peer = %q, want alice", server.PeerID())
+		}
+		if server.State() != pipe.StateConnected {
+			t.Errorf("accepted state = %s, want connected", server.State())
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("accept timed out")
+	}
+}
+
+// TestCloseAfterWriteDeliversEverything checks that Close directly after a
+// large Write does not lose the tail of the data. Closing the PeerConnection
+// aborts the SCTP association, so the session must let acknowledged delivery
+// finish first.
+func TestCloseAfterWriteDeliversEverything(t *testing.T) {
+	testutil.CheckLeaks(t)
+
+	p := newPair(t)
+	client, server := connect(t, p)
+	defer server.Close()
+
+	const size = 8 << 20
+	payload := make([]byte, size)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		if _, err := client.Write(payload); err != nil {
+			t.Errorf("write: %v", err)
+		}
+		// No pause: the bytes are in SCTP's send queue, not yet acknowledged.
+		_ = client.Close()
+	}()
+
+	_ = server.SetReadDeadline(time.Now().Add(testTimeout))
+	got, err := io.ReadAll(server)
+	if err != nil {
+		t.Fatalf("read after %d of %d bytes: %v", len(got), size, err)
+	}
+	if len(got) != size {
+		t.Fatalf("received %d of %d bytes", len(got), size)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("received bytes differ from what was sent")
+	}
+}

@@ -1,0 +1,96 @@
+# Signaling plus TURN for pipe, from the example commands in this repository.
+#
+#   cp examples/docker/.env.example examples/docker/.env   # then edit it
+#   docker compose -f examples/docker/docker-compose.yml up --build
+#
+# Two services are enough for a personal deployment:
+#
+#   signaling  HTTP signaling (put TLS in front of it; see guides/08-docker.md)
+#   turn       STUN + TURN with per-user plans, ephemeral credentials from a
+#              shared secret, and a fixed relay port range so that Docker can
+#              publish it
+#
+# The `coturn` service is an alternative relay using the widely deployed coturn
+# server, kept behind a profile so that it does not start by default:
+#
+#   docker compose -f examples/docker/docker-compose.yml --profile coturn up coturn
+
+services:
+  signaling:
+    build:
+      context: ../..
+      dockerfile: examples/docker/Dockerfile
+    image: pipe-examples
+    command:
+      - signaling
+      - -listen=:8080
+      - -path=/pipe
+      - -max-peers=${SIGNAL_MAX_PEERS:-1000}
+    environment:
+      # peer=token pairs. Tokens must be at least 16 characters.
+      PIPE_SIGNAL_TOKENS: ${PIPE_SIGNAL_TOKENS:?set PIPE_SIGNAL_TOKENS in .env}
+    ports:
+      - "${SIGNAL_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  turn:
+    image: pipe-examples
+    depends_on:
+      - signaling
+    command:
+      - turnserver
+      - -listen=0.0.0.0:3478
+      - -listen-tcp=0.0.0.0:3478
+      - -realm=${TURN_REALM:-pipe.example}
+      # The address clients will send relayed traffic to. Behind NAT this is
+      # the public IP of the host, not the container's.
+      - -relay-ip=${TURN_RELAY_IP:?set TURN_RELAY_IP in .env}
+      # Docker cannot publish "whatever port the kernel picks", so relay
+      # sockets are confined to a range that is published below.
+      - -relay-ports=${TURN_RELAY_PORTS:-49152-49252}
+      # Free users are capped at 512 KiB/s per relay socket per direction and
+      # may hold 4 relay sockets (two connections); paid users get 8 MiB/s and
+      # 32 sockets. Users pick their plan by their user ID suffix, alice@free.
+      - -plans=${TURN_PLANS:-free=512KiB/4,paid=8MiB/32}
+      - -stats=60s
+    environment:
+      # Ephemeral credentials: mint them with `turncred` (see below) or
+      # turnx.IssueCredentials from your own service.
+      PIPE_TURN_SECRET: ${PIPE_TURN_SECRET:?set PIPE_TURN_SECRET in .env}
+      # Optional static users in addition to the secret, user=password[:plan].
+      PIPE_TURN_USERS: ${PIPE_TURN_USERS:-}
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "${TURN_RELAY_PORTS:-49152-49252}:${TURN_RELAY_PORTS:-49152-49252}/udp"
+    restart: unless-stopped
+
+  # One-shot helper: docker compose run --rm turncred -user alice@free -ttl 24h
+  turncred:
+    image: pipe-examples
+    profiles: ["tools"]
+    entrypoint: ["turncred"]
+    environment:
+      PIPE_TURN_SECRET: ${PIPE_TURN_SECRET:?set PIPE_TURN_SECRET in .env}
+
+  # Alternative relay: coturn. Uses the same secret, realm, and port range, so
+  # credentials minted by turncred work against it too. coturn's bandwidth
+  # limits are per session, not per plan; see guides/07-multi-user-relay.md.
+  coturn:
+    image: coturn/coturn:4.6
+    profiles: ["coturn"]
+    command:
+      - -c
+      - /etc/coturn/turnserver.conf
+      - --realm=${TURN_REALM:-pipe.example}
+      - --external-ip=${TURN_RELAY_IP:?set TURN_RELAY_IP in .env}
+      - --static-auth-secret=${PIPE_TURN_SECRET:?set PIPE_TURN_SECRET in .env}
+      - --min-port=${TURN_RELAY_MIN:-49152}
+      - --max-port=${TURN_RELAY_MAX:-49252}
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "${TURN_RELAY_PORTS:-49152-49252}:${TURN_RELAY_PORTS:-49152-49252}/udp"
+    restart: unless-stopped
