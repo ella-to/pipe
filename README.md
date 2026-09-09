@@ -50,13 +50,42 @@ A runnable version is in [`examples/echo`](examples/echo):
 go run ./examples/echo
 ```
 
-[`examples/`](examples) also has a STUN + TURN server with a configurable
-throughput budget and a client that proves it went through the relay:
+## Two machines
+
+Peers on different machines need a signaling server to exchange offers,
+answers, and candidates, and usually STUN or TURN to find a network path.
+Everything required ships in this repository:
 
 ```sh
-go run ./examples/turnserver -rate 512KiB -stats 2s        # admin/admin on :3478
-go run ./examples/turnclient -rate 512KiB -bytes 1MiB      # self-contained
+# Somewhere both machines can reach: the HTTP signaling server.
+export PIPE_SIGNAL_TOKENS="alice=$(openssl rand -hex 24),bob=$(openssl rand -hex 24)"
+go run ./examples/signaling -listen :8080
+
+# Machine A
+go run ./examples/pipecat -signal http://signal.example:8080/pipe -token "$BOB_TOKEN" -id bob listen
+
+# Machine B
+echo hello | go run ./examples/pipecat -signal http://signal.example:8080/pipe -token "$ALICE_TOKEN" -id alice dial bob
 ```
+
+In Go, the only difference from the example above is the signaler:
+
+```go
+signaler := &sse.Client{URL: "https://signal.example.net/pipe", Token: os.Getenv("PIPE_SIGNAL_TOKEN")}
+ep, err := pipe.New(ctx, pipe.Config{
+	ID:       "alice",
+	Signaler: signaler,
+	ICEServers: []pipe.ICEServer{
+		{URLs: []string{"stun:stun.example.net:3478"}},
+		{URLs: []string{"turn:relay.example.net:3478?transport=udp"}, Username: user, Credential: pass},
+	},
+})
+```
+
+The [guides](guides/README.md) walk through all of it: concepts, a quickstart,
+the signaling server, STUN, running and securing your own TURN relay, giving
+free and paying users different relay budgets, Docker, the Go API, operations,
+and the wire protocol.
 
 ## What you get
 
@@ -66,11 +95,18 @@ network name `webrtc`. That is verified rather than asserted — [`test/compat`]
 drives `io.Copy`, `bufio`, `encoding/json`, `encoding/gob`, `tls.Conn` (TLS 1.3
 handshake and transfer), and `net/http` (with keep-alive) over live connections.
 
+`Close` returns at once and still delivers what you wrote: the stream waits in
+the background for the peer to acknowledge written data before the transport
+is torn down, so the peer reads everything and then `io.EOF`.
+
+`Endpoint.Listen` returns a `*pipe.Listener`. It satisfies `net.Listener`, and
+its `AcceptConn` method returns the concrete `*pipe.Conn` when you want
+`Stats`, `State`, or `PeerID` without a type assertion.
+
 ## Signaling
 
 Two peers cannot find each other without a third party to carry offers, answers,
-and candidates. `pipe` does not ship a mandatory signaling service; you provide
-a `Signaler`:
+and candidates. `pipe` defines the envelope and leaves the transport to you:
 
 ```go
 type Signaler interface {
@@ -83,6 +119,19 @@ type SignalConn interface {
 	Close() error
 }
 ```
+
+Two transports are included:
+
+- [`signaling/sse`](signaling/sse): HTTP. Peers receive over a Server-Sent
+  Events stream and send with POST; the server authenticates every request and
+  refuses signals whose sender does not match the credential, so peer IDs
+  delivered through it are authenticated. The event stream is produced and
+  consumed with [`ella.to/sse`](https://pkg.go.dev/ella.to/sse). Run it with
+  [`examples/signaling`](examples/signaling) or mount `sse.Server` in your own
+  `http.ServeMux`.
+- [`signaling/memory`](signaling/memory): an in-process hub for tests and
+  same-process examples, with deterministic duplicate, drop, reorder, and
+  disconnect fault injection.
 
 The rules a transport must honor: one `Receive` caller at a time, `Send` safe
 concurrently with `Receive`, both honoring their context, `Close` idempotent and
@@ -101,13 +150,27 @@ func TestConformance(t *testing.T) {
 }
 ```
 
-[`signaling/memory`](signaling/memory) is an in-process hub for tests and
-same-process examples. It also injects duplicate, drop, reorder, and disconnect
-faults deterministically.
-
 Signaling is not STUN and not TURN. STUN and TURN servers are configured through
 `Config.ICEServers` and are used by ICE to find a network path; signaling is how
 the two peers exchange the descriptions in the first place.
+
+## STUN and TURN
+
+[`examples/turnserver`](examples/turnserver) is a STUN and TURN server built
+on `pion/turn` that you can run as-is for a personal deployment. It supports
+static users and ephemeral credentials from a shared secret, a relay port range
+for firewalls and Docker, and **per-user plans**, so a free tier can be capped
+at 512 KiB/s per relay socket while paying users get more:
+
+```sh
+go run ./examples/turnserver -plans 'free=512KiB/4,paid=8MiB/32' \
+    -users 'alice=alice-secret:free,bob=bob-secret:paid' -stats 10s
+```
+
+[`examples/turnclient`](examples/turnclient) proves a connection went through
+the relay and measures it; [`examples/turncred`](examples/turncred) mints
+ephemeral credentials. [`examples/docker`](examples/docker) has a Dockerfile,
+a compose stack, and a coturn configuration.
 
 ## Configuration
 
@@ -122,6 +185,7 @@ the two peers exchange the descriptions in the first place.
 | `KeepAlive` | off | Protocol ping/pong probes; set `Interval` to enable. |
 | `Reconnect` | 3 attempts | ICE-restart recovery budget and backoff. |
 | `AcceptBacklog` | 64 | Pending inbound connections before rejection. |
+| `AllowPeer` | allow all | Refuse inbound offers from peers this returns false for. |
 | `FramePayload` | 16 KiB | Bytes per DataChannel message. |
 | `ReadBuffer` | 1 MiB | Unread-byte budget per connection. |
 | `Logger`, `Metrics` | nop | `*slog.Logger` and a metrics sink. |
@@ -134,10 +198,11 @@ logged, and neither are SDP, ICE credentials, or application payloads.
 
 Read these before deploying.
 
-- **A peer ID is a routing identity, not an authenticated one.** Authentication
-  belongs to your signaling transport. DTLS fingerprint verification guarantees
-  that only the negotiated party can send you bytes; it does not tell you who that
-  party is. For cryptographic peer identity, run mutual TLS over the pipe.
+- **A peer ID is only as authenticated as your signaling transport.** With
+  `signaling/sse` and tokens, it is. With a transport that trusts client-supplied
+  names, it is not. DTLS guarantees that only the negotiated party can send you
+  bytes; for cryptographic peer identity independent of signaling, run mutual
+  TLS over the pipe (see [guides/06-security.md](guides/06-security.md)).
 - **No half-close.** There is no `CloseWrite`. Protocols that use FIN as an
   end-of-message marker need their own framing.
 - **One reliable, ordered stream per connection** in protocol version 1.
@@ -146,7 +211,8 @@ Read these before deploying.
   `PeerConnection` closes the connection with `ErrDisconnected` instead of
   silently losing, duplicating, or reordering bytes.
 - **No published scale numbers yet.** Capacity work is deliberately not claimed
-  until it is measured.
+  until it is measured; [guides/10-operations.md](guides/10-operations.md) says
+  how to measure your own.
 
 ## Testing
 
@@ -154,4 +220,5 @@ Read these before deploying.
 go test ./...              # no network, no Docker, no root required
 go test -race ./...
 go test ./... -short       # skips the large-transfer cases
+go test -bench . ./internal/frame   # stream throughput and allocation benchmark
 ```
