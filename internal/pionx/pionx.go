@@ -18,7 +18,7 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-// DataChannel contract from design/PROTOCOL.md section 3.
+// DataChannel contract from guides/11-protocol.md section 3.
 const (
 	// ChannelLabel is the only DataChannel label pipe accepts.
 	ChannelLabel = "pipe.stream.v1"
@@ -89,6 +89,13 @@ func NewFactory(cfg Config) (*Factory, error) {
 	// write deadlines effective instead of dropping data into an unbounded
 	// queue.
 	se.EnableDataChannelBlockWrite(true)
+
+	if cfg.RelayOnly {
+		// ICE normally holds a working relay pair for two seconds in case a
+		// direct pair shows up. With relay as the only permitted type there is
+		// nothing to wait for, and the wait would be pure connect latency.
+		se.SetRelayAcceptanceMinWait(0)
+	}
 
 	if cfg.ConfigureSettingEngine != nil {
 		cfg.ConfigureSettingEngine(&se)

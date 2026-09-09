@@ -26,8 +26,8 @@ type Label struct {
 //	pipe.restart.attempts     counter   -
 //	pipe.restart.results      counter   result
 //	pipe.restart.duration     duration  -
-//	pipe.stream.bytes.read    counter   -
-//	pipe.stream.bytes.written counter   -
+//	pipe.stream.bytes.read    counter   -         (added when a connection closes)
+//	pipe.stream.bytes.written counter   -         (added when a connection closes)
 //	pipe.keepalive.rtt        duration  -
 //	pipe.keepalive.failures   counter   reason
 //	pipe.protocol.failures    counter   scope

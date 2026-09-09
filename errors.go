@@ -37,7 +37,9 @@ var (
 	ErrProtocol = errors.New("pipe: protocol violation")
 
 	// ErrPeerRejected reports that the remote peer explicitly refused the
-	// session.
+	// session, for example because it is not listening, its backlog is full,
+	// or its [Config.AllowPeer] returned false. Use [errors.As] with
+	// [*RejectedError] to read the [RejectCode].
 	ErrPeerRejected = errors.New("pipe: peer rejected the session")
 
 	// ErrPeerUnavailable reports that signaling could not reach the peer.

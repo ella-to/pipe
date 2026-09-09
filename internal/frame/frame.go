@@ -1,6 +1,6 @@
 // Package frame implements the pipe stream framing defined in
-// design/PROTOCOL.md section 4 and turns a message-oriented DataChannel into a
-// byte stream.
+// guides/11-protocol.md section 4 and turns a message-oriented DataChannel into
+// a byte stream.
 //
 // Each DataChannel message carries exactly one frame:
 //

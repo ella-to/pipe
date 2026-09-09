@@ -19,6 +19,16 @@ import (
 // held.
 const controlWriteTimeout = 5 * time.Second
 
+// drainTimeout bounds how long a locally closed stream waits for the peer to
+// acknowledge everything written, including the close frame, before the
+// channel is closed. Closing the channel is the point of no return: the owner
+// closes the PeerConnection afterwards, which aborts the SCTP association and
+// discards anything still in flight.
+const drainTimeout = 2 * time.Second
+
+// drainPoll is how often the outgoing buffer is checked while draining.
+const drainPoll = 5 * time.Millisecond
+
 // controlAcquireTimeout bounds how long the read loop waits for the write lock
 // before dropping a pong. The bound exists so that two peers writing to each
 // other under backpressure cannot deadlock on each other's control frames.
@@ -30,6 +40,9 @@ const controlAcquireTimeout = time.Second
 // A Channel is message-oriented: one Read returns exactly one message and one
 // Write sends exactly one message. Concurrent writes are safe and each message
 // is written atomically.
+//
+// A Channel that also implements [BufferedAmounter] lets the stream wait for
+// the peer's acknowledgement before the channel is closed; Pion's channel does.
 type Channel interface {
 	io.ReadWriteCloser
 
@@ -39,6 +52,12 @@ type Channel interface {
 
 	// SetWriteDeadline bounds a blocked Write.
 	SetWriteDeadline(time.Time) error
+}
+
+// BufferedAmounter reports bytes written to a channel that the peer has not
+// acknowledged yet.
+type BufferedAmounter interface {
+	BufferedAmount() uint64
 }
 
 // Config configures a [Stream].
@@ -88,22 +107,31 @@ type Stream struct {
 	// holds wsem.
 	wbuf []byte
 
-	// dataCh carries decoded application payloads from the read loop. Its
-	// capacity is the bounded unread-data budget.
+	// dataCh carries whole received data messages from the read loop. Each
+	// element is a pooled buffer holding header and payload; its capacity is
+	// the bounded unread-data budget.
 	dataCh chan []byte
-	// cur is the unconsumed remainder of the current payload, owned by
-	// whoever holds rsem.
-	cur []byte
+	// cur is the unconsumed remainder of the current payload and curBuf is the
+	// pooled buffer it aliases. Both are owned by whoever holds rsem.
+	cur    []byte
+	curBuf []byte
+
+	// free recycles receive buffers between the read loop and Read, so that
+	// steady-state reads do not allocate. A channel is used rather than a
+	// sync.Pool because storing a slice in a Pool boxes it, which is itself an
+	// allocation per frame.
+	free chan []byte
 
 	// closed reports a local close, which discards buffered data. term reports
 	// that the stream is finished for any reason and stops the read loop. done
-	// is closed when the read loop has exited.
+	// is closed when the read loop has exited. released is closed once the
+	// underlying channel has been closed, which happens after any drain.
 	closed    chan struct{}
 	term      chan struct{}
 	done      chan struct{}
+	released  chan struct{}
 	localOnce sync.Once
 	termOnce  sync.Once
-	termErr   error
 
 	mu          sync.Mutex
 	readErr     error
@@ -156,9 +184,35 @@ func NewStream(ch Channel, cfg Config) *Stream {
 		closed:        make(chan struct{}),
 		term:          make(chan struct{}),
 		done:          make(chan struct{}),
+		released:      make(chan struct{}),
+		// One buffer per queue slot, plus the one the read loop is filling and
+		// the one Read is draining.
+		free: make(chan []byte, depth+2),
 	}
 	go s.readLoop()
 	return s
+}
+
+// getBuf returns a receive buffer sized for one whole message.
+func (s *Stream) getBuf() []byte {
+	select {
+	case b := <-s.free:
+		return b
+	default:
+		return make([]byte, HeaderSize+s.maxPayload)
+	}
+}
+
+// putBuf returns a buffer obtained from getBuf, or a slice of one, to the free
+// list. It never blocks; a surplus buffer is left to the garbage collector.
+func (s *Stream) putBuf(b []byte) {
+	if cap(b) < HeaderSize+s.maxPayload {
+		return
+	}
+	select {
+	case s.free <- b[:cap(b)]:
+	default:
+	}
 }
 
 // MaxPayload returns the negotiated maximum frame payload.
@@ -167,6 +221,12 @@ func (s *Stream) MaxPayload() int { return s.maxPayload }
 // Done returns a channel that is closed when the stream is terminally finished,
 // either because the peer closed it, the channel failed, or [Stream.Close] ran.
 func (s *Stream) Done() <-chan struct{} { return s.done }
+
+// Released returns a channel that is closed once the underlying [Channel] has
+// been closed. After a local close that follows writes, this happens only when
+// the peer has acknowledged the written data or [drainTimeout] has passed, so
+// the owner should wait for it before discarding the transport underneath.
+func (s *Stream) Released() <-chan struct{} { return s.released }
 
 // Err returns the terminal error once [Stream.Done] is closed. A graceful remote
 // close reports [io.EOF].
@@ -222,7 +282,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 			if !ok {
 				return 0, s.terminalErr()
 			}
-			s.cur = b
+			s.take(b)
 			continue
 		default:
 		}
@@ -231,7 +291,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 			if !ok {
 				return 0, s.terminalErr()
 			}
-			s.cur = b
+			s.take(b)
 		case <-s.closed:
 			return 0, net.ErrClosed
 		case <-s.readDeadline.Done():
@@ -242,7 +302,19 @@ func (s *Stream) Read(p []byte) (int, error) {
 	n := copy(p, s.cur)
 	s.cur = s.cur[n:]
 	s.bytesRead.Add(uint64(n))
+	if len(s.cur) == 0 {
+		// The whole message has been consumed; hand its buffer back to the
+		// read loop.
+		s.putBuf(s.curBuf)
+		s.cur, s.curBuf = nil, nil
+	}
 	return n, nil
+}
+
+// take makes msg, a whole data message from the read loop, the current payload.
+func (s *Stream) take(msg []byte) {
+	s.curBuf = msg
+	s.cur = msg[HeaderSize:]
 }
 
 // Write implements [io.Writer]. Writes larger than the maximum frame payload are
@@ -476,6 +548,11 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 // Close closes the stream locally. It is idempotent, unblocks pending reads and
 // writes, discards data that has been received but not read, and makes a bounded
 // best-effort attempt to send a close frame first.
+//
+// Close returns without waiting for the channel itself to close. When the
+// channel reports unacknowledged data, it is closed in the background once the
+// peer has acknowledged everything or [drainTimeout] has passed; see
+// [Stream.Released].
 func (s *Stream) Close() error { return s.CloseWith(CloseNormal, "") }
 
 // CloseWith closes the stream locally and reports code and reason to the peer.
@@ -506,6 +583,11 @@ func (s *Stream) ShutdownEOF(code uint16, reason string) error {
 }
 
 func (s *Stream) terminate(code uint16, reason string, local bool) error {
+	// A local close following writes must let the peer acknowledge them; a
+	// close on a transport that already failed, or one that answers the
+	// peer's close, has nothing to wait for.
+	drain := local && s.Err() == nil
+
 	if local {
 		// Unblock readers immediately and make the terminal error explicit
 		// before anything else can classify it.
@@ -525,9 +607,50 @@ func (s *Stream) terminate(code uint16, reason string, local bool) error {
 		// Closing the underlying channel does not interrupt a read that is
 		// already blocked, so expire its read deadline first.
 		_ = s.ch.SetReadDeadline(time.Now().Add(-time.Second))
-		s.termErr = s.ch.Close()
+		go s.release(drain)
 	})
-	return s.termErr
+	return nil
+}
+
+// release closes the channel, after waiting for the peer to acknowledge
+// written data when drain is set. It runs off the caller's goroutine so that
+// Close never blocks on the network.
+func (s *Stream) release(drain bool) {
+	defer close(s.released)
+	if drain {
+		// Wait for the read loop to exit so that this goroutine is the only
+		// reader of the channel while it drains.
+		<-s.done
+		s.awaitAcks()
+	}
+	_ = s.ch.Close()
+}
+
+// awaitAcks waits until the peer has acknowledged everything written, the peer
+// has closed its side, or drainTimeout passes. Channels without
+// [BufferedAmounter] return at once.
+//
+// The peer closing its side counts as drained: it has read everything it will
+// ever read, and once its stream reset arrives SCTP stops accounting
+// acknowledgements for this stream, so waiting for the count to reach zero
+// would only run out the clock. The channel is polled with short read
+// deadlines; a read that returns data discards it (the stream is closed
+// locally), a timeout re-checks the count, and any other error means the peer
+// is gone.
+func (s *Stream) awaitAcks() {
+	ba, ok := s.ch.(BufferedAmounter)
+	if !ok {
+		return
+	}
+	deadline := time.Now().Add(drainTimeout)
+	buf := s.getBuf()
+	defer s.putBuf(buf)
+	for ba.BufferedAmount() > 0 && time.Now().Before(deadline) {
+		_ = s.ch.SetReadDeadline(time.Now().Add(drainPoll))
+		if _, err := s.ch.Read(buf); err != nil && !isTimeout(err) {
+			return
+		}
+	}
 }
 
 // sendCloseFrame makes one best-effort attempt to tell the peer why the stream
@@ -555,7 +678,9 @@ func (s *Stream) readLoop() {
 	defer close(s.done)
 	defer close(s.dataCh)
 
-	buf := make([]byte, HeaderSize+s.maxPayload)
+	// Every data message is received straight into a pooled buffer whose
+	// ownership passes to Read; control frames reuse the same buffer.
+	buf := s.getBuf()
 	for {
 		n, err := s.ch.Read(buf)
 		if err != nil {
@@ -577,10 +702,9 @@ func (s *Stream) readLoop() {
 			if len(payload) == 0 {
 				continue
 			}
-			cp := make([]byte, len(payload))
-			copy(cp, payload)
 			select {
-			case s.dataCh <- cp:
+			case s.dataCh <- buf[:n]:
+				buf = s.getBuf()
 			case <-s.term:
 				s.setReadErr(net.ErrClosed)
 				return

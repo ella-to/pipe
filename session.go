@@ -17,6 +17,21 @@ import (
 // teardown.
 const closeSignalTimeout = 2 * time.Second
 
+// closeReleaseTimeout bounds how long teardown waits for the stream to release
+// its DataChannel before the PeerConnection is closed anyway. The stream waits
+// for the peer to acknowledge written data first, because closing the
+// PeerConnection aborts the SCTP association and discards anything in flight.
+const closeReleaseTimeout = 3 * time.Second
+
+// closeAckGrace is how long a session keeps its PeerConnection open after the
+// stream has released the DataChannel, so that its final SCTP acknowledgements
+// reach the peer. SCTP delays an acknowledgement by up to 200ms; a peer whose
+// close frame is never acknowledged waits out its whole drain timeout instead.
+// The grace applies to every orderly teardown, whichever side closed first,
+// because the two sides' close paths race and either may be the one holding
+// the last acknowledgement.
+const closeAckGrace = 400 * time.Millisecond
+
 // closeLingerTimeout bounds how long a session waits for its DataChannel to
 // finish after the peer announced the close through signaling. Signaling can
 // outrun the data path, so tearing the stream down immediately would discard
@@ -804,6 +819,10 @@ func (s *session) teardown(intent *closeIntent) {
 	}
 
 	if s.stream != nil {
+		st := s.stream.Stats()
+		s.ep.cfg.Metrics.Count(metricStreamBytesRead, int64(st.BytesRead))
+		s.ep.cfg.Metrics.Count(metricStreamBytesWrite, int64(st.BytesWritten))
+
 		code, reason := streamCloseCode(intent.code), intent.reason
 		switch {
 		case intent.graceful && s.peerClosed:
@@ -818,6 +837,9 @@ func (s *session) teardown(intent *closeIntent) {
 		}
 	}
 	if s.peerConn != nil {
+		if s.stream != nil {
+			s.awaitRelease(intent)
+		}
 		if err := s.peerConn.Close(); err != nil {
 			s.log.Debug("pipe: closing peer connection", slog.String("error", err.Error()))
 		}
@@ -846,6 +868,32 @@ func (s *session) teardown(intent *closeIntent) {
 
 	s.log.Debug("pipe: session closed", slog.String("reason", closeReason(intent)))
 	close(s.finished)
+}
+
+// awaitRelease keeps the PeerConnection alive until the stream has released
+// its DataChannel, which after a local close means the peer acknowledged what
+// was written, and then for closeAckGrace so that this side's own
+// acknowledgements reach the peer. Neither wait happens when connectivity is
+// already known to be gone, because nothing could be acknowledged anyway.
+func (s *session) awaitRelease(intent *closeIntent) {
+	if errors.Is(intent.err, ErrDisconnected) || errors.Is(intent.err, ErrICE) {
+		return
+	}
+	started := s.ep.cfg.clock.Now()
+	release := time.NewTimer(closeReleaseTimeout)
+	defer release.Stop()
+	select {
+	case <-s.stream.Released():
+	case <-release.C:
+		s.log.Debug("pipe: stream did not release its channel in time")
+	}
+	grace := time.NewTimer(closeAckGrace)
+	defer grace.Stop()
+	select {
+	case <-grace.C:
+	case <-s.ep.ctx.Done():
+	}
+	s.log.Debug("pipe: transport released", slog.Duration("after", s.ep.cfg.clock.Since(started)))
 }
 
 // sendCloseSignal makes one bounded attempt to tell the peer why the session

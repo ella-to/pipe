@@ -46,7 +46,7 @@ type Endpoint struct {
 
 	mu        sync.Mutex
 	sessions  map[string]*session
-	listener  *listener
+	listener  *Listener
 	listened  bool
 	signalErr error
 	closed    bool
@@ -183,8 +183,9 @@ func (e *Endpoint) dial(ctx context.Context, peer PeerID) (*Conn, error) {
 }
 
 // Listen returns a listener that accepts inbound sessions. An endpoint has at
-// most one listener; later calls return [ErrAlreadyListening].
-func (e *Endpoint) Listen() (net.Listener, error) {
+// most one listener; later calls return [ErrAlreadyListening]. Closing the
+// listener and calling Listen again is not supported either.
+func (e *Endpoint) Listen() (*Listener, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -195,7 +196,7 @@ func (e *Endpoint) Listen() (net.Listener, error) {
 		return nil, ErrAlreadyListening
 	}
 
-	ln := &listener{
+	ln := &Listener{
 		ep:     e,
 		accept: make(chan pendingConn, e.cfg.AcceptBacklog),
 		closed: make(chan struct{}),
@@ -346,6 +347,14 @@ func (e *Endpoint) acceptOffer(sig Signal) {
 		return
 	}
 
+	if allow := e.cfg.AllowPeer; allow != nil && !allow(sig.From) {
+		e.log.Debug("pipe: refused an offer from an unauthorized peer",
+			slog.String("from", string(sig.From)))
+		e.cfg.Metrics.Count(metricAcceptResults, 1, labelResult("unauthorized"))
+		e.reject(sig, RejectUnauthorized, "peer is not allowed to connect")
+		return
+	}
+
 	select {
 	case e.inboundSlots <- struct{}{}:
 	default:
@@ -463,7 +472,7 @@ func (e *Endpoint) setSignalErr(err error) {
 }
 
 // clearListener detaches a closed listener so that new offers are rejected.
-func (e *Endpoint) clearListener(ln *listener) {
+func (e *Endpoint) clearListener(ln *Listener) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.listener == ln {

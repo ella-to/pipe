@@ -12,9 +12,13 @@ type pendingConn struct {
 	release func()
 }
 
-// listener accepts inbound sessions for an endpoint. It satisfies
-// [net.Listener].
-type listener struct {
+// Listener accepts inbound sessions for an [Endpoint]. It satisfies
+// [net.Listener], and [Listener.AcceptConn] returns the concrete [*Conn] so
+// that callers who want [Conn.Stats] or [Conn.PeerID] need no type assertion.
+//
+// An endpoint has at most one Listener at a time. Closing the listener stops
+// new sessions from being admitted; connections already accepted stay open.
+type Listener struct {
 	ep     *Endpoint
 	addr   Addr
 	accept chan pendingConn
@@ -23,11 +27,22 @@ type listener struct {
 	closed    chan struct{}
 }
 
-var _ net.Listener = (*listener)(nil)
+var _ net.Listener = (*Listener)(nil)
 
-// Accept returns the next fully negotiated connection. Offers that are still
-// negotiating never appear here.
-func (l *listener) Accept() (net.Conn, error) {
+// Accept implements [net.Listener]. It returns the next fully negotiated
+// connection as a [net.Conn]; see [Listener.AcceptConn] for the concrete type.
+func (l *Listener) Accept() (net.Conn, error) {
+	conn, err := l.AcceptConn()
+	if err != nil {
+		// Return an untyped nil so that callers comparing against nil work.
+		return nil, err
+	}
+	return conn, nil
+}
+
+// AcceptConn returns the next fully negotiated connection. Offers that are
+// still negotiating never appear here.
+func (l *Listener) AcceptConn() (*Conn, error) {
 	for {
 		select {
 		case p := <-l.accept:
@@ -52,7 +67,7 @@ func (l *listener) Accept() (net.Conn, error) {
 
 // Close stops accepting new sessions. Connections already returned by Accept stay
 // open; closing the endpoint closes those too. Close is idempotent.
-func (l *listener) Close() error {
+func (l *Listener) Close() error {
 	l.closeOnce.Do(func() {
 		close(l.closed)
 		l.ep.clearListener(l)
@@ -62,11 +77,11 @@ func (l *listener) Close() error {
 }
 
 // Addr returns the endpoint's logical address.
-func (l *listener) Addr() net.Addr { return l.addr }
+func (l *Listener) Addr() net.Addr { return l.addr }
 
 // push enqueues an established connection. The accept queue can never overflow
 // because the backlog semaphore admits at most one inbound session per slot.
-func (l *listener) push(p pendingConn) error {
+func (l *Listener) push(p pendingConn) error {
 	select {
 	case <-l.closed:
 		return errorf(ErrClosed, "pipe: listener is closed")
@@ -83,7 +98,7 @@ func (l *listener) push(p pendingConn) error {
 	}
 }
 
-func (l *listener) isClosed() bool {
+func (l *Listener) isClosed() bool {
 	select {
 	case <-l.closed:
 		return true
@@ -93,7 +108,7 @@ func (l *listener) isClosed() bool {
 }
 
 // drain closes connections that were established but never accepted.
-func (l *listener) drain() {
+func (l *Listener) drain() {
 	for {
 		select {
 		case p := <-l.accept:
@@ -107,6 +122,6 @@ func (l *listener) drain() {
 	}
 }
 
-func (l *listener) opErr(op string, err error) error {
+func (l *Listener) opErr(op string, err error) error {
 	return opError(op, l.addr, nil, err)
 }

@@ -196,6 +196,18 @@ type Config struct {
 	// be accepted. It defaults to [DefaultAcceptBacklog].
 	AcceptBacklog int
 
+	// AllowPeer, when set, is consulted for every inbound offer before any
+	// resources are committed to it. Returning false refuses the session with
+	// [RejectUnauthorized], and the dialer sees [ErrPeerRejected]. A nil
+	// AllowPeer admits every peer.
+	//
+	// The peer ID is only as trustworthy as the signaling transport that
+	// delivered it. AllowPeer is an access-control list on top of an
+	// authenticated signaler, not a substitute for one. It must be safe for
+	// concurrent use and should return quickly; it runs on the signaling
+	// receive loop.
+	AllowPeer func(peer PeerID) bool
+
 	// FramePayload is the largest application payload per stream frame. It
 	// defaults to [DefaultFramePayload] and may not exceed [MaxFramePayload].
 	FramePayload int
