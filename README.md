@@ -156,11 +156,25 @@ the two peers exchange the descriptions in the first place.
 
 ## STUN and TURN
 
-[`examples/turnserver`](examples/turnserver) is a STUN and TURN server built
-on `pion/turn` that you can run as-is for a personal deployment. It supports
-static users and ephemeral credentials from a shared secret, a relay port range
-for firewalls and Docker, and **per-user plans**, so a free tier can be capped
-at 512 KiB/s per relay socket while paying users get more:
+[`relay`](relay) is a STUN and TURN server built on `pion/turn` that you embed
+in your own program. It supports static users and ephemeral credentials from a
+shared secret, TURN over UDP and TCP, a relay port range for firewalls and
+Docker, and **per-user plans**, so a free tier can be capped at 512 KiB/s per
+relay socket while paying users get more:
+
+```go
+srv, err := relay.Start(relay.Config{
+	Listen:     "0.0.0.0:3478",
+	RelayIP:    net.ParseIP("203.0.113.10"),
+	AuthSecret: os.Getenv("PIPE_TURN_SECRET"),
+	Plans: map[string]relay.Plan{
+		"free": {Rate: 512 << 10, MaxAllocations: 4},
+		"paid": {Rate: 8 << 20, MaxAllocations: 32},
+	},
+})
+```
+
+[`examples/turnserver`](examples/turnserver) wraps it as a command:
 
 ```sh
 go run ./examples/turnserver -plans 'free=512KiB/4,paid=8MiB/32' \

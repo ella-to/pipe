@@ -20,13 +20,13 @@ import (
 	"strings"
 	"time"
 
-	"ella.to/pipe/examples/internal/turnx"
+	"ella.to/pipe/relay"
 )
 
 func main() {
 	secret := flag.String("secret", "", "shared secret (or set PIPE_TURN_SECRET)")
 	user := flag.String("user", "", "user ID, optionally with a plan suffix such as alice@free")
-	ttl := flag.Duration("ttl", turnx.DefaultCredentialTTL, "how long the credentials stay valid")
+	ttl := flag.Duration("ttl", relay.DefaultCredentialTTL, "how long the credentials stay valid")
 	turnURL := flag.String("turn", "", "TURN URL to include in the JSON output, e.g. turn:relay.example.net:3478?transport=udp")
 	asJSON := flag.Bool("json", false, "print a JSON object suitable for handing to a client")
 	flag.Parse()
@@ -39,7 +39,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	username, password, err := turnx.IssueCredentials(*secret, *user, *ttl)
+	username, password, err := relay.IssueCredentials(*secret, *user, *ttl)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "turncred:", err)
 		os.Exit(1)

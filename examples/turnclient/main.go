@@ -61,7 +61,7 @@ import (
 	"time"
 
 	"ella.to/pipe"
-	"ella.to/pipe/examples/internal/turnx"
+	"ella.to/pipe/relay"
 	"ella.to/pipe/signaling/memory"
 )
 
@@ -78,13 +78,13 @@ func main() {
 	pass := flag.String("pass", "admin", "TURN password (or set PIPE_TURN_PASSWORD)")
 	secret := flag.String("auth-secret", "",
 		"mint ephemeral credentials for -user with this shared secret instead of using -pass")
-	realm := flag.String("realm", turnx.DefaultRealm, "TURN realm; must match the server")
+	realm := flag.String("realm", relay.DefaultRealm, "TURN realm; must match the server")
 	relayOnly := flag.Bool("relay-only", true, "gather relay candidates only, so TURN cannot be bypassed")
 	sizeSpec := flag.String("bytes", "4MiB", "how much data to transfer")
 	rateSpec := flag.String("rate", "0", "default relay budget for -embedded, e.g. 512KiB; 0 is unlimited")
 	burstSpec := flag.String("burst", "0", "token bucket depth for -embedded; 0 derives it from -rate")
 	plans := flag.String("plans", "", "named plans for -embedded, e.g. free=512KiB,paid=8MiB; select one with -user name@plan")
-	maxDelay := flag.Duration("max-delay", turnx.DefaultMaxDelay,
+	maxDelay := flag.Duration("max-delay", relay.DefaultMaxDelay,
 		"how long -embedded may hold a relayed packet for budget before dropping it")
 	verbose := flag.Bool("v", false, "log debug detail")
 	flag.Parse()
@@ -136,22 +136,22 @@ func run(opts options) error {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	size, err := turnx.ParseSize(opts.sizeSpec)
+	size, err := relay.ParseSize(opts.sizeSpec)
 	if err != nil {
 		return err
 	}
 	if size <= 0 {
 		return errors.New("-bytes must be positive")
 	}
-	rateBytes, err := turnx.ParseSize(opts.rateSpec)
+	rateBytes, err := relay.ParseSize(opts.rateSpec)
 	if err != nil {
 		return err
 	}
-	burst, err := turnx.ParseSize(opts.burstSpec)
+	burst, err := relay.ParseSize(opts.burstSpec)
 	if err != nil {
 		return err
 	}
-	plans, err := turnx.ParsePlans(opts.plans)
+	plans, err := relay.ParsePlans(opts.plans)
 	if err != nil {
 		return err
 	}
@@ -160,29 +160,29 @@ func run(opts options) error {
 	defer stop()
 
 	// Either run the relay here or use the one the caller pointed us at.
-	var relay *turnx.Server
+	var srv *relay.Server
 	if opts.embedded {
-		users := map[string]turnx.User{}
+		users := map[string]relay.User{}
 		if opts.secret == "" {
-			users[opts.user] = turnx.User{Password: opts.pass}
+			users[opts.user] = relay.User{Password: opts.pass}
 		}
-		relay, err = turnx.Start(turnx.Config{
+		srv, err = relay.Start(relay.Config{
 			Listen:      "127.0.0.1:0",
 			Realm:       opts.realm,
 			Users:       users,
 			AuthSecret:  opts.secret,
 			Plans:       plans,
-			DefaultPlan: turnx.Plan{Rate: rateBytes, Burst: burst, MaxDelay: opts.maxDelay},
+			DefaultPlan: relay.Plan{Rate: rateBytes, Burst: burst, MaxDelay: opts.maxDelay},
 			Logger:      log,
 		})
 		if err != nil {
 			return err
 		}
-		defer relay.Close()
+		defer srv.Close()
 
-		opts.turnURL = relay.TURNURL()
+		opts.turnURL = srv.TURNURL()
 		if opts.stunURL == "" {
-			opts.stunURL = relay.STUNURL()
+			opts.stunURL = srv.STUNURL()
 		}
 	}
 	if opts.turnURL == "" {
@@ -193,7 +193,7 @@ func run(opts options) error {
 	// would mint it for a signed-in user, and expires on its own.
 	username, credential := opts.user, opts.pass
 	if opts.secret != "" {
-		username, credential, err = turnx.IssueCredentials(opts.secret, opts.user, time.Hour)
+		username, credential, err = relay.IssueCredentials(opts.secret, opts.user, time.Hour)
 		if err != nil {
 			return err
 		}
@@ -235,7 +235,7 @@ func run(opts options) error {
 		}
 	}
 	fmt.Printf("transfer:    %s (echoed, so every byte crosses the relay four times)\n\n",
-		turnx.FormatSize(size))
+		relay.FormatSize(size))
 
 	// Signaling is separate from STUN and TURN: it carries the descriptions that
 	// let the two peers find each other. The in-process hub keeps this example to
@@ -291,14 +291,14 @@ func run(opts options) error {
 	}
 
 	fmt.Printf("\ntransferred  %s round trip in %v\n",
-		turnx.FormatSize(size), elapsed.Round(time.Millisecond))
-	fmt.Printf("throughput   %s/s each way\n", turnx.FormatSize(int64(float64(size)/elapsed.Seconds())))
+		relay.FormatSize(size), elapsed.Round(time.Millisecond))
+	fmt.Printf("throughput   %s/s each way\n", relay.FormatSize(int64(float64(size)/elapsed.Seconds())))
 	report(conn)
 
-	if relay != nil {
-		st := relay.Stats()
+	if srv != nil {
+		st := srv.Stats()
 		fmt.Printf("\nrelay        %s\n", st)
-		for _, id := range turnx.SortedUsers(st) {
+		for _, id := range relay.SortedUsers(st) {
 			fmt.Printf("user %-8s %s\n", id, st.Users[id])
 		}
 	}
@@ -383,7 +383,7 @@ func report(conn net.Conn) {
 	fmt.Printf("state        %s, candidates %s/%s, read %s, written %s\n",
 		s.State,
 		candidate(s.LocalCandidate), candidate(s.RemoteCandidate),
-		turnx.FormatSize(int64(s.BytesRead)), turnx.FormatSize(int64(s.BytesWritten)))
+		relay.FormatSize(int64(s.BytesRead)), relay.FormatSize(int64(s.BytesWritten)))
 }
 
 func candidate(c pipe.CandidateType) string {
@@ -397,7 +397,7 @@ func rateLabel(rateBytes int64) string {
 	if rateBytes <= 0 {
 		return "unlimited"
 	}
-	return turnx.FormatSize(rateBytes) + "/s per direction"
+	return relay.FormatSize(rateBytes) + "/s per direction"
 }
 
 func envOr(key, fallback string) string {

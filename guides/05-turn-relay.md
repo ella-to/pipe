@@ -1,156 +1,686 @@
-# Running your own TURN relay
+# TURN relay
 
-This guide is for anyone who wants pipe connections to work between any two
-networks, including the ones where hole punching fails, and who would rather
-run a small relay than depend on a commercial one. It covers the
-`examples/turnserver` command flag by flag, a real deployment on a VPS with
-firewall and systemd, TCP transport for UDP-hostile networks, coturn as the
-production alternative, how the throughput budget works, how to test with
-`examples/turnclient`, and what to check when it does not work. Per-user
-plans and ephemeral credentials get their own guide,
-[07-multi-user-relay.md](07-multi-user-relay.md).
+TURN relays traffic for peers that cannot reach each other directly. A peer
+asks the relay for an **allocation** (a public `ip:port` on the relay), and ICE
+uses it as a `relay` candidate when nothing better works. The relay sees only
+DTLS ciphertext; it costs you bandwidth.
 
-## Why you need TURN
+Each step gives a complete relay program (`relayd/main.go`) and the change to
+the client's `iceServers`. The same relay is also a ready-made command:
+`go run ella.to/pipe/examples/turnserver@latest -h`.
 
-STUN ([04-stun.md](04-stun.md)) lets peers find each other's public
-addresses, and for most home networks that is enough. It is not enough when
-both peers sit behind symmetric NATs, when a firewall drops UDP to unknown
-hosts, or when a network only allows outbound TCP. Those cases are common
-enough (corporate networks, mobile carriers, hotels, some countries) that a
-service which must always connect needs a fallback.
+| Step | Adds |
+| --- | --- |
+| [1](#step-1-the-smallest-relay) | A local relay and a client forced through it |
+| [2](#step-2-real-users) | One password per user |
+| [3](#step-3-public-address) | Public address, relay port range, firewall |
+| [4](#step-4-udp-and-tcp) | TURN over TCP for networks that block UDP |
+| [5](#step-5-tiers-free-pro-unlimited) | Free, pro, and unlimited plans |
+| [6](#step-6-ephemeral-credentials) | Expiring credentials from your API, carrying the tier |
+| [7](#step-7-tiers-from-your-database) | Tier looked up on the relay instead |
+| [8](#step-8-everything-together) | The final relay and client |
 
-TURN (Traversal Using Relays around NAT, RFC 8656) is that fallback. A peer
-opens a connection to the TURN server and asks for an **allocation**: a
-public `ip:port` on the server. Packets sent to that address are forwarded to
-the peer over the connection it opened, which works from behind any NAT
-because the peer initiated it. ICE advertises the allocation as a `relay`
-candidate, tries it last, and uses it only when nothing better works.
+## Step 1: the smallest relay
 
-Everything that crosses the relay is DTLS ciphertext. The relay operator sees
-addresses and byte counts, not content. What the operator pays for is
-bandwidth, which is why every TURN server requires credentials and why a
-budget per user matters.
+```go
+// relayd/main.go
+package main
 
-## The example server
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
 
-`examples/turnserver` is a complete STUN and TURN server built on `pion/turn`.
-One UDP listener answers both protocols. It authenticates users from a static
-table or from a shared secret, applies a throughput budget per relay socket,
-enforces per-user allocation quotas, and reports traffic counters. It serves
-IPv4 over UDP, with an optional TCP listener, and does not terminate TLS.
+	"ella.to/pipe/relay"
+)
 
-### Local development
+func main() {
+	srv, err := relay.Start(relay.Config{
+		Listen: "127.0.0.1:3478",
+		Users:  map[string]relay.User{"admin": {Password: "admin"}},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer srv.Close()
+	log.Println(srv.STUNURL(), srv.TURNURL())
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	<-ctx.Done()
+}
+```
+
+The client is the `peer/main.go` from [02-quickstart.md](02-quickstart.md)
+with two changes. Point `iceServers` at the relay:
+
+```go
+func iceServers() []pipe.ICEServer {
+	return []pipe.ICEServer{
+		{URLs: []string{"stun:127.0.0.1:3478"}},
+		{
+			URLs:       []string{"turn:127.0.0.1:3478?transport=udp"},
+			Username:   "admin",
+			Credential: "admin",
+		},
+	}
+}
+```
+
+And force the relay while testing, by adding this to its `pipe.Config`:
+
+```go
+ICETransportPolicy: pipe.ICETransportPolicyRelay,
+```
 
 ```sh
-go run ./examples/turnserver
+go run ./relayd
+go run ./signal
+go run ./peer listen bob
+echo hi | go run ./peer dial alice bob
+# connected via relay/relay
 ```
 
+`relay/relay` proves the bytes went through TURN. Remove the relay-only policy
+in production, so ICE uses direct paths when they exist.
+
+## Step 2: real users
+
+```go
+// relayd/main.go
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+
+	"ella.to/pipe/relay"
+)
+
+func main() {
+	// PIPE_TURN_USERS="alice=<password>,bob=<password>"
+	users, err := relay.ParseUsers(os.Getenv("PIPE_TURN_USERS"))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	srv, err := relay.Start(relay.Config{
+		Listen: "127.0.0.1:3478",
+		Realm:  "relay.example.net",
+		Users:  users,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer srv.Close()
+	log.Println(srv.STUNURL(), srv.TURNURL())
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	<-ctx.Done()
+}
 ```
-stun:  stun:127.0.0.1:3478
-turn:  turn:127.0.0.1:3478?transport=udp
-realm: pipe.example
-users: admin
-try:  go run ./examples/turnclient -embedded=false -turn turn:127.0.0.1:3478?transport=udp -user admin -pass '<password>'
+
+```go
+func iceServers() []pipe.ICEServer {
+	return []pipe.ICEServer{
+		{URLs: []string{"stun:127.0.0.1:3478"}},
+		{
+			URLs:       []string{"turn:127.0.0.1:3478?transport=udp"},
+			Username:   os.Getenv("PIPE_TURN_USERNAME"),
+			Credential: os.Getenv("PIPE_TURN_PASSWORD"),
+		},
+	}
+}
 ```
-
-The defaults are `admin`/`admin` on loopback, unlimited throughput, and
-ephemeral relay ports chosen by the kernel. Log lines go to stderr; the URLs
-above go to stdout so a script can capture them.
-
-### Flags
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `-listen` | `127.0.0.1:3478` | UDP address for STUN and TURN. Use `0.0.0.0:3478` to serve every interface. |
-| `-listen-tcp` | off | TCP address on which TURN is also served, for clients that cannot use UDP. |
-| `-realm` | `pipe.example` | TURN realm. It is part of the credential digest, so clients using long-term credentials must be given the same realm. |
-| `-users` | `admin=admin` | Comma-separated `user=password[:plan]` list. `PIPE_TURN_USERS` overrides the flag. |
-| `-auth-secret` | off | Shared secret for ephemeral credentials. `PIPE_TURN_SECRET` overrides the flag. Static users keep working alongside. |
-| `-plans` | none | Comma-separated `name=rate[/maxallocations]` list, for example `free=512KiB/4,paid=8MiB/32`. |
-| `-relay-ip` | the listen address | Address advertised to clients as their relay address. Required when listening on `0.0.0.0` and whenever the server is behind NAT. |
-| `-relay-ports` | kernel-chosen | Inclusive UDP port range for relay sockets, for example `49152-49252`. Needed behind a firewall or a Docker port mapping. |
-| `-rate` | `0` (unlimited) | Default plan: bytes per second per relay socket per direction. Accepts `512KiB`, `4MiB`, `1MB`, plain numbers. |
-| `-burst` | derived | Default plan: token bucket depth in bytes. Zero derives a tenth of a second of `-rate`, never below 64 KiB. |
-| `-max-delay` | `20ms` | How long a relayed packet may be held waiting for budget before it is dropped. |
-| `-max-allocations` | `0` (unlimited) | Default plan: concurrent relay sockets per user. |
-| `-stats` | off | Interval for logging traffic counters, overall and per user. |
-| `-v` | off | Debug logging. |
-
-The command refuses to start with an empty user list and no secret, because
-such a relay would refuse everyone. Passwords are converted to the RFC 5389
-key digest at startup and never logged; a rejected allocation is logged with
-the username, realm, and source address only.
-
-### Size and rate syntax
-
-Sizes accept binary suffixes (`KiB`, `MiB`, `GiB`, and the short forms `K`,
-`M`, `G`, which are also binary), decimal suffixes (`KB`, `MB`, `GB`), a bare
-`B`, or a bare number of bytes. `512KiB` is 524288 bytes per second; `1MB`
-is 1000000. A rate of `0` means unlimited.
-
-## A real deployment
-
-### What the server needs
-
-- A public IPv4 address, or a NAT with the ports below forwarded and the
-  public address known to you.
-- UDP 3478 inbound for STUN and TURN, TCP 3478 if you enable `-listen-tcp`.
-- A UDP port range inbound for relay sockets. Peers send their traffic to
-  those ports.
-- Bandwidth. Every relayed byte enters the server once and leaves it once.
-
-### Build and install
 
 ```sh
-CGO_ENABLED=0 go build -o /usr/local/bin/pipe-turnserver ./examples/turnserver
+PIPE_TURN_USERS="alice=$(openssl rand -hex 16),bob=$(openssl rand -hex 16)" go run ./relayd
 ```
 
-The binary is static and has no runtime dependencies.
+Clients do not configure the realm; the relay announces it.
 
-### Run it
+## Step 3: public address
+
+```go
+// relayd/main.go
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+
+	"ella.to/pipe/relay"
+)
+
+func main() {
+	users, err := relay.ParseUsers(os.Getenv("PIPE_TURN_USERS"))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	srv, err := relay.Start(relay.Config{
+		Listen:  "0.0.0.0:3478",
+		RelayIP: net.ParseIP("203.0.113.10"), // public IP; required with 0.0.0.0 or behind NAT
+		MinPort: 49152,                       // relay sockets stay in a range you can open
+		MaxPort: 49252,
+		Realm:   "relay.example.net",
+		Users:   users,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer srv.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	<-ctx.Done()
+}
+```
 
 ```sh
-export PIPE_TURN_USERS="alice=$(openssl rand -hex 16),bob=$(openssl rand -hex 16)"
-pipe-turnserver \
-    -listen 0.0.0.0:3478 \
-    -listen-tcp 0.0.0.0:3478 \
-    -relay-ip 203.0.113.10 \
-    -relay-ports 49152-49252 \
-    -realm relay.example.net \
-    -stats 60s
+ufw allow 3478/udp
+ufw allow 49152:49252/udp
 ```
 
-Points that matter here:
+```go
+func iceServers() []pipe.ICEServer {
+	return []pipe.ICEServer{
+		{URLs: []string{"stun:relay.example.net:3478"}},
+		{
+			URLs:       []string{"turn:relay.example.net:3478?transport=udp"},
+			Username:   os.Getenv("PIPE_TURN_USERNAME"),
+			Credential: os.Getenv("PIPE_TURN_PASSWORD"),
+		},
+	}
+}
+```
 
-- `-relay-ip` is the address clients will send relayed packets to. It must be
-  the server's **public** address. When the server listens on `0.0.0.0` the
-  flag is mandatory; when the server is behind a NAT it must be the NAT's
-  external address, not the interface address the server itself sees.
-- `-relay-ports` confines relay sockets to a range you can open on the
-  firewall. Each active allocation uses one port. A hundred ports serve fifty
-  concurrent pipe connections (one allocation per side when both sides relay
-  through you).
-- `-realm` is any string, conventionally your domain. Clients that use
-  long-term credentials do not configure the realm explicitly; the server
-  announces it in the 401 challenge and the client derives the key from
-  `username:realm:password`. Changing the realm invalidates nothing for
-  clients, but the digest table on the server is recomputed at startup from
-  the passwords, so it is simply a restart.
-- Write the credentials to the environment, not to the command line, so that
-  they do not appear in `ps` output.
+Test from a different network than the relay:
 
-### Firewall
+```sh
+go run ella.to/pipe/examples/turnclient@latest -embedded=false \
+    -turn 'turn:relay.example.net:3478?transport=udp' -user alice -pass "$ALICE_PW"
+```
 
-With `nftables` or `iptables`, allow:
+## Step 4: UDP and TCP
 
-| Direction | Protocol | Port(s) | Purpose |
-| --- | --- | --- | --- |
-| Inbound | UDP | 3478 | STUN and TURN control and data |
-| Inbound | TCP | 3478 | TURN over TCP (`-listen-tcp`) |
-| Inbound | UDP | 49152-49252 | Relay sockets (`-relay-ports`) |
-| Outbound | UDP | any | Relayed traffic toward peers |
+Add `ListenTCP`. Everything else stays.
 
-For `ufw`:
+```go
+// relayd/main.go
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+
+	"ella.to/pipe/relay"
+)
+
+func main() {
+	users, err := relay.ParseUsers(os.Getenv("PIPE_TURN_USERS"))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	srv, err := relay.Start(relay.Config{
+		Listen:    "0.0.0.0:3478",
+		ListenTCP: "0.0.0.0:3478",
+		RelayIP:   net.ParseIP("203.0.113.10"),
+		MinPort:   49152,
+		MaxPort:   49252,
+		Realm:     "relay.example.net",
+		Users:     users,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer srv.Close()
+	log.Println(srv.TURNURL(), srv.TURNTCPURL())
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	<-ctx.Done()
+}
+```
+
+```sh
+ufw allow 3478/tcp
+```
+
+Both transports go in one `ICEServer`. ICE prefers UDP when it works.
+
+```go
+func iceServers() []pipe.ICEServer {
+	return []pipe.ICEServer{
+		{URLs: []string{"stun:relay.example.net:3478"}},
+		{
+			URLs: []string{
+				"turn:relay.example.net:3478?transport=udp",
+				"turn:relay.example.net:3478?transport=tcp",
+			},
+			Username:   os.Getenv("PIPE_TURN_USERNAME"),
+			Credential: os.Getenv("PIPE_TURN_PASSWORD"),
+		},
+	}
+}
+```
+
+Only the client-to-relay leg is TCP. For `turns:` (TLS), see
+[TLS](#tls-turns).
+
+## Step 5: tiers: free, pro, unlimited
+
+A `relay.Plan` caps each relay socket's rate (bytes per second per direction)
+and how many sockets a user may hold. Zero means unlimited.
+
+```go
+// relayd/main.go
+package main
+
+import (
+	"context"
+	"log"
+	"log/slog"
+	"net"
+	"os"
+	"os/signal"
+	"time"
+
+	"ella.to/pipe/relay"
+)
+
+func main() {
+	srv, err := relay.Start(relay.Config{
+		Listen:    "0.0.0.0:3478",
+		ListenTCP: "0.0.0.0:3478",
+		RelayIP:   net.ParseIP("203.0.113.10"),
+		MinPort:   49152,
+		MaxPort:   49252,
+		Realm:     "relay.example.net",
+		Plans: map[string]relay.Plan{
+			"free":      {Rate: 512 << 10, MaxAllocations: 4}, // 512 KiB/s
+			"pro":       {Rate: 8 << 20, MaxAllocations: 32},  // 8 MiB/s
+			"unlimited": {},                                   // no caps
+		},
+		DefaultPlan: relay.Plan{Rate: 256 << 10, MaxAllocations: 2}, // users without a plan
+		Users: map[string]relay.User{
+			"alice": {Password: os.Getenv("ALICE_PW"), Plan: "free"},
+			"bob":   {Password: os.Getenv("BOB_PW"), Plan: "pro"},
+			"ops":   {Password: os.Getenv("OPS_PW"), Plan: "unlimited"},
+			"guest": {Password: os.Getenv("GUEST_PW")},
+		},
+		Logger: slog.Default(),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer srv.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	tick := time.NewTicker(time.Minute)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			st := srv.Stats()
+			for _, id := range relay.SortedUsers(st) {
+				log.Printf("%s %s", id, st.Users[id])
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+```
+
+The client does not change: the tier belongs to the credential.
+
+```
+alice plan=free allocations=2 active=2 sent=2.2MiB received=2.2MiB dropped=352.3KiB/301pkt rejected=0
+bob plan=pro allocations=1 active=1 sent=10.0KiB received=313.8KiB dropped=0B/0pkt rejected=0
+```
+
+`dropped` growing means the user is at the rate cap; `rejected` growing means
+they hit `MaxAllocations`.
+
+Compare tiers on one machine (embedded relay, plan chosen by `name@plan`):
+
+```sh
+for p in free pro unlimited; do
+  go run ella.to/pipe/examples/turnclient@latest -plans 'free=512KiB,pro=8MiB,unlimited=0' -user alice@$p -bytes 1MiB
+done
+# free       throughput   62.6KiB/s each way
+# pro        throughput   3.8MiB/s each way
+# unlimited  throughput   30.5MiB/s each way
+```
+
+Measured throughput is below the plan rate because that test echoes, so every
+byte crosses the relay four times. See [the budget](#how-the-throughput-budget-works).
+
+## Step 6: ephemeral credentials
+
+Static passwords never expire. Instead, share a secret between the relay and
+your API. The API mints `<expiry>:<user id>` plus an HMAC password; the relay
+verifies it with no user list. The tier rides in the user ID as `name@plan`.
+
+The relay: replace `Users` with `AuthSecret`.
+
+```go
+// relayd/main.go
+package main
+
+import (
+	"context"
+	"log"
+	"log/slog"
+	"net"
+	"os"
+	"os/signal"
+
+	"ella.to/pipe/relay"
+)
+
+func main() {
+	srv, err := relay.Start(relay.Config{
+		Listen:     "0.0.0.0:3478",
+		ListenTCP:  "0.0.0.0:3478",
+		RelayIP:    net.ParseIP("203.0.113.10"),
+		MinPort:    49152,
+		MaxPort:    49252,
+		Realm:      "relay.example.net",
+		AuthSecret: os.Getenv("PIPE_TURN_SECRET"),
+		Plans: map[string]relay.Plan{
+			"free":      {Rate: 512 << 10, MaxAllocations: 4},
+			"pro":       {Rate: 8 << 20, MaxAllocations: 32},
+			"unlimited": {},
+		},
+		DefaultPlan: relay.Plan{Rate: 256 << 10, MaxAllocations: 2},
+		Logger:      slog.Default(),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer srv.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	<-ctx.Done()
+}
+```
+
+Your API: a signed-in user asks for relay credentials.
+
+```go
+// api/main.go
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"ella.to/pipe/relay"
+)
+
+type account struct {
+	ID          string
+	Paid, Staff bool
+}
+
+// Replace with your own session lookup.
+var sessions = map[string]account{
+	"alice-session": {ID: "alice"},
+	"bob-session":   {ID: "bob", Paid: true},
+}
+
+type relayCreds struct {
+	STUN       []string  `json:"stun"`
+	TURN       []string  `json:"turn"`
+	Username   string    `json:"username"`
+	Credential string    `json:"credential"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+func main() {
+	secret := os.Getenv("PIPE_TURN_SECRET")
+
+	http.HandleFunc("GET /relay-credentials", func(w http.ResponseWriter, r *http.Request) {
+		session, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		acct, ok := sessions[session]
+		if !ok {
+			http.Error(w, "sign in first", http.StatusUnauthorized)
+			return
+		}
+
+		plan := "free"
+		switch {
+		case acct.Staff:
+			plan = "unlimited"
+		case acct.Paid:
+			plan = "pro"
+		}
+
+		const ttl = 12 * time.Hour
+		user, pass, err := relay.IssueCredentials(secret, acct.ID+"@"+plan, ttl)
+		if err != nil {
+			http.Error(w, "could not issue credentials", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(relayCreds{
+			STUN: []string{"stun:relay.example.net:3478"},
+			TURN: []string{
+				"turn:relay.example.net:3478?transport=udp",
+				"turn:relay.example.net:3478?transport=tcp",
+			},
+			Username:   user,
+			Credential: pass,
+			ExpiresAt:  time.Now().Add(ttl),
+		})
+	})
+
+	log.Fatal(http.ListenAndServe("127.0.0.1:9000", nil))
+}
+```
+
+The client fetches credentials before `pipe.New`. Add these to `peer/main.go`
+and pass `iceServers(creds)` in the config:
+
+```go
+type relayCreds struct {
+	STUN       []string  `json:"stun"`
+	TURN       []string  `json:"turn"`
+	Username   string    `json:"username"`
+	Credential string    `json:"credential"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+func fetchRelayCreds(ctx context.Context, url, session string) (relayCreds, error) {
+	var c relayCreds
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return c, err
+	}
+	req.Header.Set("Authorization", "Bearer "+session)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return c, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return c, fmt.Errorf("relay credentials: %s", resp.Status)
+	}
+	return c, json.NewDecoder(resp.Body).Decode(&c)
+}
+
+func iceServers(c relayCreds) []pipe.ICEServer {
+	return []pipe.ICEServer{
+		{URLs: c.STUN},
+		{URLs: c.TURN, Username: c.Username, Credential: c.Credential},
+	}
+}
+```
+
+Mint one by hand for scripts and tests:
+
+```sh
+PIPE_TURN_SECRET=... go run ella.to/pipe/examples/turncred@latest -user alice@pro -ttl 1h
+```
+
+- **New credentials mean a new `Endpoint`**: `pipe.New` copies the config.
+  Pick a TTL longer than an endpoint's lifetime, or rebuild before
+  `ExpiresAt`.
+- **Upgrade**: issue `alice@pro` instead of `alice@free` and rebuild. Live
+  connections keep the plan they were allocated with.
+- **Revoke everyone**: restart the relay with a new `PIPE_TURN_SECRET`.
+
+## Step 7: tiers from your database
+
+Keep user IDs plain (`alice`) and resolve the plan on the relay with
+`PlanFor`. It runs per allocation, never per packet, but keep it cheap.
+
+```go
+// relayd/main.go
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"sync"
+
+	"ella.to/pipe/relay"
+)
+
+// accounts is refreshed from your database in the background.
+var (
+	mu       sync.RWMutex
+	accounts = map[string]string{"alice": "free", "bob": "pro", "ops": "unlimited"}
+)
+
+func planFor(userID string) string {
+	mu.RLock()
+	defer mu.RUnlock()
+	return accounts[userID] // "" selects DefaultPlan
+}
+
+func main() {
+	srv, err := relay.Start(relay.Config{
+		Listen:     "0.0.0.0:3478",
+		ListenTCP:  "0.0.0.0:3478",
+		RelayIP:    net.ParseIP("203.0.113.10"),
+		MinPort:    49152,
+		MaxPort:    49252,
+		Realm:      "relay.example.net",
+		AuthSecret: os.Getenv("PIPE_TURN_SECRET"),
+		Plans: map[string]relay.Plan{
+			"free":      {Rate: 512 << 10, MaxAllocations: 4},
+			"pro":       {Rate: 8 << 20, MaxAllocations: 32},
+			"unlimited": {},
+		},
+		DefaultPlan: relay.Plan{Rate: 256 << 10, MaxAllocations: 2},
+		PlanFor:     planFor,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer srv.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	<-ctx.Done()
+}
+```
+
+The API then mints `relay.IssueCredentials(secret, acct.ID, ttl)` without the
+`@plan` suffix. The client does not change.
+
+## Step 8: everything together
+
+The relay: UDP and TCP, public address, ephemeral credentials, an ops user
+with a static password, three tiers, a stats endpoint, and graceful shutdown.
+
+```go
+// relayd/main.go
+//
+//	PIPE_TURN_SECRET=$(openssl rand -hex 32) OPS_TURN_PW=$(openssl rand -hex 16) \
+//	RELAY_PUBLIC_IP=203.0.113.10 go run ./relayd
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+
+	"ella.to/pipe/relay"
+)
+
+func main() {
+	publicIP := net.ParseIP(os.Getenv("RELAY_PUBLIC_IP"))
+	if publicIP == nil {
+		log.Fatal("set RELAY_PUBLIC_IP")
+	}
+
+	srv, err := relay.Start(relay.Config{
+		Listen:     "0.0.0.0:3478",
+		ListenTCP:  "0.0.0.0:3478",
+		RelayIP:    publicIP,
+		MinPort:    49152,
+		MaxPort:    49252,
+		Realm:      "relay.example.net",
+		AuthSecret: os.Getenv("PIPE_TURN_SECRET"),
+		Users: map[string]relay.User{
+			"ops": {Password: os.Getenv("OPS_TURN_PW"), Plan: "unlimited"},
+		},
+		Plans: map[string]relay.Plan{
+			"free":      {Rate: 512 << 10, MaxAllocations: 4},
+			"pro":       {Rate: 8 << 20, MaxAllocations: 32},
+			"unlimited": {},
+		},
+		DefaultPlan: relay.Plan{Rate: 256 << 10, MaxAllocations: 2},
+		Logger:      slog.Default(),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer srv.Close()
+
+	// Private stats endpoint; keep it off the public interface.
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(srv.Stats())
+		})
+		log.Println(http.ListenAndServe("127.0.0.1:9100", mux))
+	}()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	<-ctx.Done()
+}
+```
 
 ```sh
 ufw allow 3478/udp
@@ -158,448 +688,285 @@ ufw allow 3478/tcp
 ufw allow 49152:49252/udp
 ```
 
-Relayed packets leave from the relay ports toward whatever address the peer
-is at, so outbound UDP must be unrestricted.
+The client: credentials from your API, UDP and TCP, direct paths preferred.
 
-### systemd unit
+```go
+// peer/main.go
+//
+//	PIPE_SESSION=alice-session go run ./peer listen alice
+//	echo hi | PIPE_SESSION=bob-session go run ./peer dial bob alice
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"time"
+
+	"ella.to/pipe"
+	"ella.to/pipe/signaling/sse"
+)
+
+type relayCreds struct {
+	STUN       []string  `json:"stun"`
+	TURN       []string  `json:"turn"`
+	Username   string    `json:"username"`
+	Credential string    `json:"credential"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+func fetchRelayCreds(ctx context.Context, url, session string) (relayCreds, error) {
+	var c relayCreds
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return c, err
+	}
+	req.Header.Set("Authorization", "Bearer "+session)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return c, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return c, fmt.Errorf("relay credentials: %s", resp.Status)
+	}
+	return c, json.NewDecoder(resp.Body).Decode(&c)
+}
+
+func main() {
+	if len(os.Args) < 3 {
+		log.Fatal("usage: peer listen <id> | peer dial <id> <peer>")
+	}
+	ctx := context.Background()
+	mode, id := os.Args[1], pipe.PeerID(os.Args[2])
+
+	creds, err := fetchRelayCreds(ctx, envOr("PIPE_API_URL", "http://127.0.0.1:9000/relay-credentials"),
+		os.Getenv("PIPE_SESSION"))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	ep, err := pipe.New(ctx, pipe.Config{
+		ID: id,
+		Signaler: &sse.Client{
+			URL:   envOr("PIPE_SIGNAL_URL", "http://127.0.0.1:8080/pipe"),
+			Token: os.Getenv("PIPE_SIGNAL_TOKEN"),
+		},
+		ICEServers: []pipe.ICEServer{
+			{URLs: creds.STUN},
+			{URLs: creds.TURN, Username: creds.Username, Credential: creds.Credential},
+		},
+		ICETransportPolicy: pipe.ICETransportPolicyAll,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ep.Close()
+
+	switch mode {
+	case "listen":
+		ln, err := ep.Listen()
+		if err != nil {
+			log.Fatal(err)
+		}
+		for {
+			conn, err := ln.AcceptConn()
+			if err != nil {
+				log.Fatal(err)
+			}
+			go func() {
+				defer conn.Close()
+				st := conn.Stats()
+				log.Printf("%s via %s/%s", conn.PeerID(), st.LocalCandidate, st.RemoteCandidate)
+				_, _ = io.Copy(os.Stdout, conn)
+			}()
+		}
+	case "dial":
+		conn, err := ep.Dial(ctx, pipe.PeerID(os.Args[3]))
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer conn.Close()
+		st := conn.Stats()
+		log.Printf("via %s/%s", st.LocalCandidate, st.RemoteCandidate)
+		_, _ = io.Copy(conn, os.Stdin)
+	}
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+```
+
+Plans in depth, quotas, and a combined relay-plus-API program:
+[07-multi-user-relay.md](07-multi-user-relay.md).
+
+---
+
+## Reference
+
+### `relay.Config`
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `Listen` | `127.0.0.1:0` | UDP address for STUN and TURN |
+| `ListenTCP` | off | TCP address for TURN over TCP |
+| `Realm` | `pipe.example` | Part of the credential digest; announced to clients |
+| `Users` | none | Static users: `map[username]relay.User{Password, Plan}` |
+| `AuthSecret` | off | Enables ephemeral credentials (`relay.IssueCredentials`) |
+| `Plans` | none | `map[name]relay.Plan{Rate, Burst, MaxDelay, MaxAllocations}` |
+| `DefaultPlan` | unlimited | Plan for users without one |
+| `PlanFor` | `Users[id].Plan`, then the `name@plan` suffix | Custom plan lookup by user ID |
+| `RelayIP` | the listen IP | Address advertised to clients; required with `0.0.0.0` or behind NAT |
+| `MinPort`, `MaxPort` | kernel-chosen | Relay socket port range |
+| `Logger` | discard | Logs usernames and relay addresses, never passwords |
+
+`relay.Server`: `STUNURL()`, `TURNURL()`, `TURNTCPURL()`, `Stats()`,
+`IssueCredentials(userID, ttl)`, `Close()`. Helpers: `ParseUsers`,
+`ParsePlans`, `ParseSize`, `ParsePortRange`, `FormatSize`, `SortedUsers`.
+
+### turnserver command
+
+The same relay as flags:
+
+```sh
+go run ella.to/pipe/examples/turnserver@latest \
+    -listen 0.0.0.0:3478 -listen-tcp 0.0.0.0:3478 \
+    -relay-ip 203.0.113.10 -relay-ports 49152-49252 \
+    -realm relay.example.net \
+    -plans 'free=512KiB/4,pro=8MiB/32,unlimited=0' \
+    -rate 256KiB -max-allocations 2 \
+    -stats 60s
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-listen` | `127.0.0.1:3478` | UDP address |
+| `-listen-tcp` | off | TCP address |
+| `-realm` | `pipe.example` | Realm |
+| `-users` | `admin=admin` | `user=password[:plan],...`; `PIPE_TURN_USERS` overrides |
+| `-auth-secret` | off | Shared secret; `PIPE_TURN_SECRET` overrides |
+| `-plans` | none | `name=rate[/maxallocations],...`; rate `0` is unlimited |
+| `-relay-ip` | listen address | Public relay address |
+| `-relay-ports` | kernel-chosen | `min-max` |
+| `-rate`, `-burst`, `-max-delay`, `-max-allocations` | unlimited | Default plan |
+| `-stats` | off | Log per-user counters at this interval |
+
+Sizes accept `512KiB`, `8MiB`, `1MB`, or plain bytes.
+
+### Firewall
+
+| Direction | Protocol | Ports |
+| --- | --- | --- |
+| Inbound | UDP | 3478 |
+| Inbound | TCP | 3478 (with `ListenTCP`) |
+| Inbound | UDP | the relay range |
+| Outbound | UDP | any |
+
+One relay socket per relaying side of each connection.
+
+### systemd
+
+```sh
+CGO_ENABLED=0 go build -o /usr/local/bin/relayd ./relayd
+```
 
 ```ini
-# /etc/systemd/system/pipe-turnserver.service
+# /etc/systemd/system/relayd.service
 [Unit]
-Description=pipe STUN/TURN relay
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=turn
-Group=turn
-EnvironmentFile=/etc/pipe-turnserver.env
-ExecStart=/usr/local/bin/pipe-turnserver \
-    -listen 0.0.0.0:3478 \
-    -listen-tcp 0.0.0.0:3478 \
-    -relay-ip 203.0.113.10 \
-    -relay-ports 49152-49252 \
-    -realm relay.example.net \
-    -plans free=512KiB/4,paid=8MiB/32 \
-    -stats 300s
+EnvironmentFile=/etc/relayd.env
+ExecStart=/usr/local/bin/relayd
 Restart=always
-RestartSec=2
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target
 ```
 
 ```sh
-# /etc/pipe-turnserver.env  (mode 0600, owned by root)
-PIPE_TURN_USERS=alice=...:free,bob=...:paid
+# /etc/relayd.env (mode 0600)
 PIPE_TURN_SECRET=...
+OPS_TURN_PW=...
+RELAY_PUBLIC_IP=203.0.113.10
 ```
-
-Port 3478 is above 1024, so the service needs no capabilities. Enable with
-`systemctl enable --now pipe-turnserver` and watch
-`journalctl -u pipe-turnserver -f` for the periodic `turn: traffic` lines.
 
 ### Behind NAT
 
-A relay behind a NAT works if the NAT forwards UDP 3478, TCP 3478, and the
-relay port range to it and `-relay-ip` is set to the NAT's public address.
-The server binds its relay sockets to its own interface address and tells
-clients the public one; the NAT translates in between. Nothing else is
-needed, but every one of those ports must be forwarded or allocations will
-succeed and carry no traffic.
+Forward UDP 3478, TCP 3478, and the relay range, and set `RelayIP` to the
+NAT's public address.
 
-## TCP transport
+### TLS (`turns:`)
 
-Some networks block UDP entirely. Peers on such networks can still reach a
-TURN server over TCP, and the server relays to the other peer over UDP as
-usual. Enable the listener:
-
-```sh
-pipe-turnserver -listen 0.0.0.0:3478 -listen-tcp 0.0.0.0:3478 -relay-ip 203.0.113.10 ...
-```
-
-and give clients a second URL:
+`relay` does not terminate TLS. Put a TCP TLS terminator (HAProxy `mode tcp`,
+`stunnel`) on 5349 in front of `ListenTCP`, or use coturn. Then:
 
 ```go
-{
-	URLs: []string{
-		"turn:relay.example.net:3478?transport=udp",
-		"turn:relay.example.net:3478?transport=tcp",
-	},
-	Username:   user,
-	Credential: pass,
-}
+URLs: []string{
+	"turn:relay.example.net:3478?transport=udp",
+	"turn:relay.example.net:3478?transport=tcp",
+	"turns:relay.example.net:5349?transport=tcp",
+},
 ```
 
-ICE gathers a relay candidate through each and prefers UDP when it works.
-Only the leg between the peer and the relay is TCP; SCTP's own congestion
-control still runs end to end, so throughput on the TCP leg is somewhat lower
-than on UDP, and latency spikes under loss are larger. It is still far better
-than not connecting.
+### coturn
 
-## TLS (`turns:`)
-
-`turns:` wraps TURN in TLS on TCP, usually on port 5349. It exists for
-networks that only let HTTPS-looking traffic out. The payload is already
-DTLS-encrypted, so `turns:` adds no confidentiality for your data; it adds
-reachability and hides the TURN protocol from middleboxes.
-
-The example server does **not** terminate TLS. Two ways to get `turns:`:
-
-1. Run coturn (below) with `tls-listening-port=5349`, `cert=`, and `pkey=`.
-   coturn accepts the same credentials and the same relay configuration.
-2. Put a TCP-level TLS terminator in front of the example server's TCP
-   listener, for example HAProxy in `mode tcp` or `stunnel`, decrypting on
-   5349 and forwarding to `127.0.0.1:3478`. The relay then sees the
-   terminator's address as the client's source address, which is fine: TURN
-   authenticates by credential, not by address.
-
-Pipe accepts `turns:` URLs and passes them to Pion, which handles the TLS
-handshake. The certificate must be valid for the host name in the URL.
-
-## coturn as the production alternative
-
-coturn is the reference production TURN server. Use it when you need TLS,
-IPv6, a database of users, or years of operational track record. The
-configuration below is the one shipped in
-`examples/docker/coturn/turnserver.conf`; the values that depend on your
-deployment are passed on the command line in the Docker setup so that they
-can live in `.env`, but you can also write them into the file.
+coturn accepts the same ephemeral credentials. It has no per-user plans:
+`max-bps` and `user-quota` apply to everyone. Full hardened configuration:
+`examples/docker/coturn/turnserver.conf`. The essentials:
 
 ```
-# coturn configuration for pipe.
-
-# STUN and TURN on the standard port, UDP and TCP.
 listening-port=3478
-
-# Ephemeral credentials in the TURN REST API format: username "expiry:user",
-# password HMAC-SHA1(secret, username), which is what turncred and
-# turnx.IssueCredentials produce. The secret comes from --static-auth-secret.
+realm=relay.example.net
+external-ip=203.0.113.10
 use-auth-secret
-
-# Each relay allocation and each peer permission expire on their own; nothing
-# needs a database.
-no-cli
-no-tlsv1
-no-tlsv1_1
-fingerprint
-
-# Refuse to relay to private ranges and to the server itself, so that an
-# authenticated client cannot use the relay to reach the internal network.
+static-auth-secret=<same as PIPE_TURN_SECRET>
+min-port=49152
+max-port=49252
+user-quota=8
+max-bps=1048576
 no-multicast-peers
 denied-peer-ip=10.0.0.0-10.255.255.255
 denied-peer-ip=172.16.0.0-172.31.255.255
 denied-peer-ip=192.168.0.0-192.168.255.255
 denied-peer-ip=127.0.0.0-127.255.255.255
-denied-peer-ip=169.254.0.0-169.254.255.255
-denied-peer-ip=::1
-denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
-denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
-
-# Quotas. user-quota is concurrent allocations per username, total-quota is
-# the server-wide bound. max-bps is bytes per second per allocation and applies
-# to everyone; coturn has no per-user tiers, which is why the Go turnserver
-# exists. bps-capacity caps the whole server.
-user-quota=8
-total-quota=1000
-max-bps=1048576
-bps-capacity=0
-
-# Log to stdout for `docker compose logs`.
-log-file=stdout
-simple-log
-```
-
-Add for a bare-metal deployment:
-
-```
-realm=relay.example.net
-external-ip=203.0.113.10
-static-auth-secret=<the same secret you give turncred>
-min-port=49152
-max-port=49252
-# TLS
 tls-listening-port=5349
 cert=/etc/letsencrypt/live/relay.example.net/fullchain.pem
 pkey=/etc/letsencrypt/live/relay.example.net/privkey.pem
 ```
 
-How the options map to the example server:
+### How the throughput budget works
 
-| coturn | Example server | Notes |
-| --- | --- | --- |
-| `listening-port` | `-listen` / `-listen-tcp` | coturn listens on UDP and TCP with one option. |
-| `external-ip` | `-relay-ip` | The public relay address. |
-| `min-port` / `max-port` | `-relay-ports` | Relay socket range. |
-| `realm` | `-realm` | Must match what clients with static passwords were given. |
-| `user=name:password` (with `lt-cred-mech`) | `-users` | Static long-term credentials. |
-| `use-auth-secret` + `static-auth-secret` | `-auth-secret` | Same HMAC-SHA1 scheme; `turncred` output works with both. |
-| `user-quota` | `-max-allocations` or a plan's `/N` | coturn's is per username, global. |
-| `max-bps` | `-rate` or a plan's rate | coturn's is per allocation for every user; no plans. |
-| `bps-capacity` | none | Server-wide cap; the example server has no global cap. |
-| `denied-peer-ip` | none | The example server relays to any address; see [06-security.md](06-security.md). |
-| `tls-listening-port`, `cert`, `pkey` | none | The example server does not terminate TLS. |
+Each relay socket gets one token bucket per direction at the plan's rate.
+Client-to-peer traffic over budget is dropped immediately; peer-to-client
+traffic may wait up to `MaxDelay` (20 ms) and is then dropped. SCTP sees real
+congestion and slows down. The rate is per socket per direction, so an echo
+between two relayed peers crosses four buckets and measures well below the
+rate; a one-way transfer through one relayed side comes close to it.
 
-If you need per-user tiers with coturn, see the coturn section of
-[07-multi-user-relay.md](07-multi-user-relay.md).
+### Troubleshooting
 
-## How the throughput budget works
-
-When a plan has a rate, every relay socket the server allocates for that
-plan's users gets two token buckets, one per direction, each filling at the
-plan's rate with a depth of the plan's burst (a tenth of a second of rate by
-default, never below 64 KiB so that a single datagram can always pass).
-
-The two directions are treated differently on purpose:
-
-- **Client to peer** (packets the client sends through its allocation) is
-  **policed**. This path runs on the goroutine that serves every client of
-  the listener, so it must never block. A datagram over budget is dropped and
-  the client is told it was sent, which is exactly what a congested link
-  does.
-- **Peer to client** (packets arriving at the relay address) is **shaped**.
-  This path has its own goroutine per allocation, so a datagram may be held
-  up to `-max-delay` (20 ms by default) to stay inside the budget, and is
-  dropped only if it would need longer.
-
-The point is that the congestion is real. SCTP inside the pipe connection
-sees delay and loss and reduces its sending rate the way it would on a
-genuinely slow link. A knob that only reported a number would tell you
-nothing about how your application behaves when a free user hits the cap.
-
-### Why measured throughput is lower than the rate
-
-The rate is per relay socket per direction. A pipe connection where both
-sides relay through the same server uses two allocations, and a byte from
-alice to bob crosses the server twice: in through alice's allocation and out
-through bob's. If bob echoes it back, it crosses twice more. `turnclient`
-measures an echo, so every byte is metered four times, each crossing has its
-own bucket, and the drops make SCTP back off between crossings. With a
-512 KiB/s plan an echoed 1 MiB transfer measures roughly 80 KiB/s each way on
-loopback; a one-way transfer between two peers where only one side relays
-sees something much closer to the cap. Read the relay counters in the same
-output: they show what was actually metered and what was dropped, and the
-dropped bytes explain the gap.
-
-## Testing with turnclient
-
-`examples/turnclient` moves data through a pipe connection that is forced
-onto a relay, and reports what it measured.
-
-### Self-contained
-
-```sh
-go run ./examples/turnclient
-```
-
-It starts a relay in-process, connects two endpoints through it with
-`ICETransportPolicyRelay`, transfers 4 MiB as an echo, and prints a report.
-Output from a `-bytes 512KiB` run on one machine:
-
-```
-turn:        turn:127.0.0.1:55711?transport=udp
-stun:        stun:127.0.0.1:55711
-user:        admin (realm pipe.example)
-policy:      relay
-relay rate:  unlimited
-transfer:    512.0KiB (echoed, so every byte crosses the relay four times)
-
-connected in 3ms
-state        connected, candidates relay/relay, read 0B, written 0B
-
-transferred  512.0KiB round trip in 17ms
-throughput   28.6MiB/s each way
-state        connected, candidates relay/relay, read 512.0KiB, written 512.0KiB
-
-relay        allocations=2 active=2 sent=1.1MiB/1294pkt received=1.1MiB/1294pkt dropped=0B/0pkt delayed=0pkt
-user admin    plan=default allocations=2 active=2 sent=1.1MiB received=1.1MiB dropped=0B/0pkt rejected=0
-```
-
-`candidates relay/relay` is the line that matters. With `-relay-only` (the
-default) ICE gathers relay candidates only, so it cannot quietly pick the
-direct host path and report a success that never touched the relay. Numbers
-from a loopback run describe the mechanism, not capacity.
-
-Squeeze the relay:
-
-```sh
-go run ./examples/turnclient -rate 512KiB -bytes 1MiB
-```
-
-### Against a server you run
-
-```sh
-go run ./examples/turnclient -embedded=false \
-    -turn 'turn:relay.example.net:3478?transport=udp' \
-    -stun 'stun:relay.example.net:3478' \
-    -user alice -pass "$ALICE_PASSWORD" -bytes 1MiB
-```
-
-`PIPE_TURN_USERNAME` and `PIPE_TURN_PASSWORD` are read when the flags are
-empty. The `-realm` flag only affects the embedded server; against an
-external server the realm comes from the server's challenge.
-
-Flags:
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `-embedded` | `true` | Run a relay in-process. |
-| `-turn` | none | TURN URL; required with `-embedded=false`. |
-| `-stun` | none | Optional STUN URL. |
-| `-user` | `admin` | TURN username, or user ID when `-auth-secret` is set. |
-| `-pass` | `admin` | TURN password. |
-| `-auth-secret` | none | Mint ephemeral credentials for `-user` instead of using `-pass`. |
-| `-realm` | `pipe.example` | Realm of the embedded server. |
-| `-relay-only` | `true` | Gather relay candidates only. |
-| `-bytes` | `4MiB` | Transfer size. |
-| `-rate`, `-burst`, `-max-delay` | unlimited | Default plan of the embedded server. |
-| `-plans` | none | Named plans for the embedded server; select with `-user name@plan`. |
-| `-v` | off | Debug logging from pipe and the relay. |
-
-### Reading the numbers honestly
-
-`connected in` is the time from `Dial` to an open DataChannel, including the
-TURN allocation and ICE checks. `throughput` is one direction of the echo:
-transfer size divided by round-trip time. Compare it with the relay
-counters, not with the plan rate, and remember that the transfer crosses the
-relay four times.
-
-## Client configuration in Go
-
-```go
-package main
-
-import (
-	"context"
-	"log"
-	"os"
-
-	"ella.to/pipe"
-	"ella.to/pipe/signaling/sse"
-)
-
-func newEndpoint(ctx context.Context, id pipe.PeerID) (*pipe.Endpoint, error) {
-	return pipe.New(ctx, pipe.Config{
-		ID:       id,
-		Signaler: &sse.Client{URL: os.Getenv("PIPE_SIGNAL_URL"), Token: os.Getenv("PIPE_SIGNAL_TOKEN")},
-		ICEServers: []pipe.ICEServer{
-			// STUN first: cheap, and it lets ICE find a direct path when one exists.
-			{URLs: []string{"stun:relay.example.net:3478"}},
-			// TURN as the fallback. UDP and TCP transports of the same server.
-			{
-				URLs: []string{
-					"turn:relay.example.net:3478?transport=udp",
-					"turn:relay.example.net:3478?transport=tcp",
-				},
-				Username:       os.Getenv("PIPE_TURN_USERNAME"),
-				Credential:     os.Getenv("PIPE_TURN_PASSWORD"),
-				CredentialType: pipe.ICECredentialPassword, // the default; shown for clarity
-			},
-		},
-		// Leave this at the default (all) in production so that direct paths
-		// are used when possible. Set relay to force the relay, which is how
-		// you test it and how you keep peers from learning each other's
-		// addresses.
-		ICETransportPolicy: pipe.ICETransportPolicyAll,
-	})
-}
-
-func main() {
-	ep, err := newEndpoint(context.Background(), "alice")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer ep.Close()
-}
-```
-
-Rules enforced by `pipe.New`: a TURN URL requires both `Username` and
-`Credential`; `ICETransportPolicyRelay` requires at least one TURN URL;
-`ICECredentialOAuth` is not supported. Credentials are never logged, never
-put in metrics labels, and never included in signaling messages.
-
-When only one peer needs the relay (the other has a public address or a
-friendly NAT), ICE will pair the relay candidate on one side with a direct
-candidate on the other, and only one allocation is used. `Conn.Stats()`
-reports the pair, for example `relay/srflx`.
-
-## Capacity planning
-
-Rules of thumb for the example server or coturn:
-
-- **Bandwidth is metered twice.** Every relayed byte enters and leaves the
-  server. A connection pushing 1 MiB/s through the relay costs 2 MiB/s of
-  server bandwidth, or 4 MiB/s when both sides relay through you.
-- **One allocation per relaying side.** A pipe connection uses one relay
-  socket per side that relays. Size `-relay-ports` accordingly: 200 ports
-  serve 100 fully relayed connections.
-- **Each allocation has its own budget.** With `-rate 512KiB`, ten users
-  each get 512 KiB/s per direction per allocation; the server has no global
-  cap. Use the plan's `/maxallocations` to bound how many sockets one user
-  can hold. See [07-multi-user-relay.md](07-multi-user-relay.md).
-- **Allocations expire.** Pion clients refresh them; an abandoned allocation
-  disappears after its lifetime (10 minutes by default in pion/turn).
-- **CPU is rarely the limit.** Relaying is a copy per packet. A small VM
-  saturates its network link long before its CPU.
-- **Watch the counters.** `-stats 300s` logs overall and per-user traffic,
-  drops, and rejected allocations. Drops on a plan mean users are hitting
-  their cap; rejected allocations mean they hit the quota.
-
-## Troubleshooting
-
-**The server logs `turn: rejected an allocation` and the client never connects.**
-The username is unknown, the password is wrong, or with ephemeral credentials
-the credential has expired or was minted with a different secret. If you use
-`turnclient -embedded=false`, note that it authenticates against the realm the
-server announces; a `-realm` mismatch only matters for the embedded server.
-With static credentials the realm is part of the key, so a server restarted
-with a new `-realm` still accepts the same passwords (it recomputes the
-digests), but a client that cached an old challenge must retry.
-
-**Allocations succeed, `connected in` is fine, but no bytes flow or the transfer stalls.**
-Peers cannot reach the relay address. Either `-relay-ip` is wrong (an
-internal address, or `0.0.0.0` was refused at startup), or the relay port
-range is not open on the firewall or not forwarded through the NAT. Check the
-`turn: allocated a relay` log line: the `relay=` address is what peers are
-told.
-
-**`candidates host/host` although you expected the relay.**
-The client is not using `ICETransportPolicyRelay`, so ICE preferred the
-direct path. That is correct behavior in production. For a relay test, force
-the policy (`turnclient -relay-only`, `pipecat -relay-only`).
-
-**`pipe.New` fails with "ICETransportPolicy relay requires a TURN server".**
-You set the relay policy without a `turn:` URL, or the TURN entry was
-rejected for missing credentials.
-
-**Startup fails with "listening on a wildcard address requires an explicit RelayIP".**
-Add `-relay-ip` with the public address.
-
-**Startup fails with "MinPort and MaxPort must both be set".**
-`-relay-ports` needs the form `min-max` with both ends.
-
-**Connections work over UDP but a particular user never connects.**
-Their network blocks UDP. Enable `-listen-tcp` and give clients the
-`?transport=tcp` URL too, or run coturn for `turns:`.
-
-**Throughput through a capped plan is far below the cap.**
-Expected; see the budget section above. Check the relay's `dropped` counter
-for that user and remember the echo test crosses the relay four times.
-
-**Everything works on one machine and fails across the internet.**
-The one-machine test never leaves loopback, so `-relay-ip`, port forwarding,
-and firewall rules are untested. Run `turnclient -embedded=false` from a
-different network against the deployed server; if allocations succeed but
-data does not flow, it is the relay address or port range.
-
-## Where to go next
-
-- Plans, quotas, and ephemeral credentials: [07-multi-user-relay.md](07-multi-user-relay.md)
-- Threat model and hardening: [06-security.md](06-security.md)
-- Docker Compose for signaling plus TURN: [08-docker.md](08-docker.md)
-- Metrics, logging, and tuning: [10-operations.md](10-operations.md)
+| Symptom | Cause |
+| --- | --- |
+| Relay logs `turn: rejected an allocation` | Wrong password, expired credential, or a different secret |
+| Allocation succeeds, no bytes flow | `RelayIP` is not the public address, or the relay range is closed |
+| `host/host` although you expected `relay` | Policy is `All` and a direct path worked; that is correct |
+| `ICETransportPolicy relay requires a TURN server` | Relay-only policy without a `turn:` URL |
+| `listening on a wildcard address requires an explicit RelayIP` | Set `RelayIP` |
+| `allocation quota reached` | User at `MaxAllocations` |
+| One user never connects | UDP blocked on their network: add `?transport=tcp` |
+| Works locally, fails on the internet | Test with `turnclient -embedded=false` from another network |

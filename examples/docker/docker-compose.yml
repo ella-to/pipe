@@ -55,7 +55,7 @@ services:
       - -stats=60s
     environment:
       # Ephemeral credentials: mint them with `turncred` (see below) or
-      # turnx.IssueCredentials from your own service.
+      # relay.IssueCredentials from your own service.
       PIPE_TURN_SECRET: ${PIPE_TURN_SECRET:?set PIPE_TURN_SECRET in .env}
       # Optional static users in addition to the secret, user=password[:plan].
       PIPE_TURN_USERS: ${PIPE_TURN_USERS:-}

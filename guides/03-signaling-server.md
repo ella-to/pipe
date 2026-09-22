@@ -1,93 +1,113 @@
-# The signaling server
+# Signaling server
 
-This guide is for whoever runs the piece that lets two pipe peers find each
-other: what the bundled HTTP signaling server (`signaling/sse`) does, how to run
-and embed it, how it authenticates peers, how to put it behind TLS and a
-reverse proxy, and how to write a different signaling transport if HTTP is not
-what you want. If you have not read [01-concepts.md](01-concepts.md), the short
-version is: signaling carries offers, answers, and ICE candidates between two
-named peers; it never carries your data.
+`sse.Server` is an `http.Handler`. Peers hold one Server-Sent Events stream
+open to receive signals, and POST to send them. It carries a few KiB per
+connection and never sees application data.
 
-## What the server carries, and what it never sees
+| Step | Adds |
+| --- | --- |
+| [1](#step-1-minimal) | A local server with no authentication |
+| [2](#step-2-bearer-tokens) | One token per peer |
+| [3](#step-3-production-http-server) | TLS, timeouts, health check, limits, graceful shutdown |
+| [4](#step-4-your-own-authentication) | Stateless tokens minted by your API |
+| [5](#step-5-client-options) | Client knobs: one client for many peers, custom HTTP client |
+| [6](#step-6-behind-a-reverse-proxy) | Caddy and nginx settings |
+| [7](#step-7-your-own-transport) | Replace HTTP with your own signaler, and test it |
 
-Per connection between two peers, the signaling server moves:
-
-| Kind | Count per connection | Size |
-| --- | --- | --- |
-| `offer` | 1 | a few KiB of SDP |
-| `answer` | 1 | a few KiB of SDP |
-| `candidate` | 2 to 10 each way | under 1 KiB each |
-| `ice-complete` | 1 each way | empty |
-| `restart` and its `answer` | per ICE restart | a few KiB |
-| `reject` or `close` | 1 | under 1 KiB |
-
-Everything is JSON in the `pipe.Signal` envelope
-([11-protocol.md](11-protocol.md)), carried on a Server-Sent Events stream that
-is written and parsed by [`ella.to/sse`](https://pkg.go.dev/ella.to/sse); this
-package adds the routing, authentication, queues, and replay around it. The
-server validates the envelope, checks
-that `from` names the authenticated caller, and queues it for `to`. It does not
-parse SDP or candidates. Application bytes flow peer to peer, or through a TURN
-relay, encrypted with DTLS using key fingerprints that were carried in the SDP,
-so a signaling server that behaves honestly cannot read the connection, and a
-dishonest one can at most substitute itself for a peer, which is the same
-trust you place in any introducer. Mutual TLS over the pipe
-([09-client-api.md](09-client-api.md)) removes even that.
-
-## Running the example server
-
-```sh
-export PIPE_SIGNAL_TOKENS="alice=$(openssl rand -hex 24),bob=$(openssl rand -hex 24)"
-go run ./examples/signaling -listen :8080
-# signaling: http://localhost:8080/pipe
-# health:    http://localhost:8080/healthz
-```
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `-listen` | `127.0.0.1:8080` | TCP address to serve HTTP on. |
-| `-path` | `/pipe` | Path the signaling handler is mounted at; clients use `scheme://host:port/pipe`. |
-| `-tokens` | | Comma-separated `peer=token` list. `PIPE_SIGNAL_TOKENS` takes precedence when set. |
-| `-insecure-trust-peer-header` | `false` | Believe `X-Pipe-Peer` without any credential. Local development only. |
-| `-max-peers` | `0` | Bound on concurrently known peers; 0 is unlimited. |
-| `-offline-grace` | `30s` | How long a disconnected peer keeps its queue before it is forgotten. |
-| `-tls-cert` | | PEM certificate; with `-tls-key`, serve HTTPS directly. |
-| `-tls-key` | | PEM private key. |
-| `-v` | `false` | Debug logging. |
-
-Rules the example enforces on tokens: at least 16 characters, unique across
-peers, and no empty peer or token. It refuses to start without a token source
-or the insecure flag.
-
-`GET /healthz` answers `ok peers=N`, where N is the number of peers known to
-the server (attached or inside their offline grace). Point a load balancer
-health check or an uptime monitor at it.
-
-The example's `http.Server` is set up the way this handler needs:
+## Step 1: minimal
 
 ```go
-httpServer := &http.Server{
-	Addr:    ":8080",
-	Handler: mux,
-	// No WriteTimeout: it would cut every event stream. The handler sets a
-	// per-write deadline itself.
-	ReadHeaderTimeout: 10 * time.Second,
-	IdleTimeout:       120 * time.Second,
-}
-```
-
-## Embedding the server in your own program
-
-`sse.Server` is an `http.Handler`. Mount it next to whatever else you serve:
-
-```go
+// signal/main.go
 package main
 
 import (
 	"log"
+	"net/http"
+
+	"ella.to/pipe/signaling/sse"
+)
+
+func main() {
+	srv, err := sse.NewServer(sse.Config{Authenticator: sse.TrustPeerHeader()})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer srv.Close()
+
+	http.Handle("/pipe", srv)
+	log.Fatal(http.ListenAndServe("127.0.0.1:8080", nil))
+}
+```
+
+Client side:
+
+```go
+ep, err := pipe.New(ctx, pipe.Config{
+	ID:       "alice",
+	Signaler: &sse.Client{URL: "http://127.0.0.1:8080/pipe"},
+})
+```
+
+`TrustPeerHeader` lets anyone act as anyone. Loopback only.
+
+## Step 2: bearer tokens
+
+```go
+// signal/main.go
+package main
+
+import (
+	"log"
+	"net/http"
+	"os"
+
+	"ella.to/pipe"
+	"ella.to/pipe/signaling/sse"
+)
+
+func main() {
+	srv, err := sse.NewServer(sse.Config{
+		Authenticator: sse.StaticTokens(map[string]pipe.PeerID{
+			os.Getenv("ALICE_TOKEN"): "alice",
+			os.Getenv("BOB_TOKEN"):   "bob",
+		}),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer srv.Close()
+
+	http.Handle("/pipe", srv)
+	log.Fatal(http.ListenAndServe("127.0.0.1:8080", nil))
+}
+```
+
+```go
+Signaler: &sse.Client{
+	URL:   "http://127.0.0.1:8080/pipe",
+	Token: os.Getenv("ALICE_TOKEN"),
+},
+```
+
+The server rejects a request whose token does not match the peer ID the client
+claims, and a signal whose `from` is not the caller. Peer IDs delivered through
+`sse` are therefore authenticated, which is what makes `Config.AllowPeer` a
+real access-control list.
+
+## Step 3: production HTTP server
+
+```go
+// signal/main.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"time"
 
 	"ella.to/pipe"
@@ -95,233 +115,212 @@ import (
 )
 
 func main() {
-	signal, err := sse.NewServer(sse.Config{
+	srv, err := sse.NewServer(sse.Config{
 		Authenticator: sse.StaticTokens(map[string]pipe.PeerID{
 			os.Getenv("ALICE_TOKEN"): "alice",
 			os.Getenv("BOB_TOKEN"):   "bob",
 		}),
-		MaxPeers: 500,
-		Logger:   slog.Default(),
+		MaxPeers:     1000,
+		OfflineGrace: 30 * time.Second,
+		Logger:       slog.Default(),
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer signal.Close()
 
 	mux := http.NewServeMux()
-	mux.Handle("/pipe", signal)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("my app\n"))
+	mux.Handle("/pipe", srv)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, "ok peers=%d\n", len(srv.Peers()))
 	})
 
-	srv := &http.Server{
+	httpServer := &http.Server{
 		Addr:              ":8443",
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		// WriteTimeout deliberately unset.
+		IdleTimeout:       120 * time.Second,
+		// No WriteTimeout: it would cut every event stream. The handler bounds
+		// each write itself.
 	}
-	log.Fatal(srv.ListenAndServeTLS("cert.pem", "key.pem"))
+
+	go func() {
+		err := httpServer.ListenAndServeTLS("cert.pem", "key.pem")
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	<-ctx.Done()
+
+	// Close the handler first so streaming requests return, then shut down.
+	_ = srv.Close()
+	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = httpServer.Shutdown(shutdown)
 }
 ```
 
-`Server.Peers()` lists known peer IDs, sorted. `Server.Close()` detaches every
-stream and makes the handler answer 503 afterwards; call it before
-`http.Server.Shutdown` so that streaming handlers return promptly.
-
-## Authentication
-
-Every request is bound to a peer identity by the configured `Authenticator`:
-
 ```go
-type Authenticator interface {
-	Authenticate(r *http.Request) (pipe.PeerID, error)
-}
+Signaler: &sse.Client{URL: "https://signal.example.net:8443/pipe", Token: os.Getenv("ALICE_TOKEN")},
 ```
 
-The server then enforces two things on every request. If the client sent an
-`X-Pipe-Peer` header (the bundled client always does), it must equal the
-authenticated ID, or the request gets 403; that makes a client configured with
-the wrong token fail at `Open` with a clear message instead of signaling under
-a name it does not own. And a POSTed signal whose `from` is not the
-authenticated ID gets 403. The consequence is that peer IDs delivered through
-this transport are authenticated, which is what makes `pipe.Config.AllowPeer`
-a real access-control list rather than a suggestion.
+`sse.Config`:
 
-### `StaticTokens`
+| Field | Default | Bounds |
+| --- | --- | --- |
+| `Authenticator` | required | Who may act as which peer |
+| `QueueSize` | 256 | Undelivered signals per peer; beyond it senders get 503 |
+| `ReplayDepth` | 256 | Delivered signals kept for a reconnecting stream |
+| `OfflineGrace` | 30s | How long a disconnected peer keeps its queue; after it, senders get 404 (`pipe.ErrPeerUnavailable`) |
+| `KeepAlive` | 15s | Comment line on idle streams, for proxies and dead-stream detection |
+| `MaxPeers` | 0 (unlimited) | Concurrently known peers; new peers beyond it get 503 |
+| `Logger` | discard | Tokens, SDP, and candidates are never logged |
 
-Bearer tokens, one per peer, compared in constant time:
+## Step 4: your own authentication
 
-```go
-auth := sse.StaticTokens(map[string]pipe.PeerID{
-	"7d3a…": "alice",
-	"c91f…": "bob",
-})
-```
-
-Right for a personal deployment with a handful of devices. Rotate a token by
-restarting with a new map.
-
-### `TrustPeerHeader`
+Any `func(*http.Request) (pipe.PeerID, error)` works. This one verifies
+stateless tokens of the form `peer.signature` that your API mints with a shared
+secret, so the signaling server needs no user list.
 
 ```go
-auth := sse.TrustPeerHeader()
-```
-
-Believes the `X-Pipe-Peer` header. Anyone who can reach the server can be
-anyone. Use it on `127.0.0.1` while developing and nowhere else.
-
-### Your own: cookies, JWTs, a database
-
-Anything that maps a request to a peer ID is an `AuthenticatorFunc`. A
-session-cookie example:
-
-```go
+// signal/main.go
+//
+//	SIGNAL_SECRET=$(openssl rand -hex 32) go run ./signal
+//	SIGNAL_SECRET=... go run ./signal token alice   # prints a token for alice
 package main
 
 import (
-	"errors"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"fmt"
+	"log"
 	"net/http"
+	"os"
+	"strings"
 
 	"ella.to/pipe"
 	"ella.to/pipe/signaling/sse"
 )
 
-type sessions interface {
-	Lookup(sessionID string) (userID string, ok bool)
+func sign(secret []byte, peer string) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(peer))
+	return peer + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-func cookieAuth(store sessions) sse.Authenticator {
+func hmacAuth(secret []byte) sse.Authenticator {
 	return sse.AuthenticatorFunc(func(r *http.Request) (pipe.PeerID, error) {
-		c, err := r.Cookie("session")
-		if err != nil {
-			return "", sse.ErrUnauthorized
-		}
-		user, ok := store.Lookup(c.Value)
+		token, ok := sse.BearerToken(r)
 		if !ok {
 			return "", sse.ErrUnauthorized
 		}
-		// One user may have several devices; put the device in the peer ID
-		// and check it belongs to the user.
-		device := r.Header.Get(sse.PeerHeader)
-		if device == "" || !ownsDevice(user, device) {
-			return "", errors.New("device does not belong to user")
+		peer, _, ok := strings.Cut(token, ".")
+		if !ok || !hmac.Equal([]byte(token), []byte(sign(secret, peer))) {
+			return "", sse.ErrUnauthorized
 		}
-		return pipe.PeerID(device), nil
+		return pipe.PeerID(peer), nil
 	})
 }
 
-func ownsDevice(user, device string) bool { /* your lookup */ return true }
+func main() {
+	secret := []byte(os.Getenv("SIGNAL_SECRET"))
+	if len(secret) == 0 {
+		log.Fatal("set SIGNAL_SECRET")
+	}
+
+	if len(os.Args) == 3 && os.Args[1] == "token" {
+		fmt.Println(sign(secret, os.Args[2]))
+		return
+	}
+
+	srv, err := sse.NewServer(sse.Config{Authenticator: hmacAuth(secret)})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer srv.Close()
+
+	http.Handle("/pipe", srv)
+	log.Fatal(http.ListenAndServe("127.0.0.1:8080", nil))
+}
 ```
 
-A JWT variant verifies the token from `sse.BearerToken(r)` and returns the
-subject (or a device claim) as the peer ID. Whatever you return, the server
-compares it with `X-Pipe-Peer`, so the client's configured ID must match the
-identity your credential proves. The error you return is never sent to the
-client; it is logged at debug level only.
+The same shape covers session cookies (`r.Cookie`), JWTs (verify
+`sse.BearerToken(r)` and return a claim), or client certificates
+(`r.TLS.PeerCertificates`). The returned error is never sent to the client.
 
-## The wire protocol, briefly
+## Step 5: client options
 
-One URL, two methods.
-
-**`GET`** opens the event stream for the authenticated peer. The response is
-`text/event-stream` with these events:
-
-| Event | Data | Meaning |
-| --- | --- | --- |
-| `hello` | JSON string, the peer ID | Sent first. The client checks it against its own ID and fails `Open` on a mismatch. |
-| `signal` | JSON `pipe.Signal` | One signal. Carries an `id:` line with a per-peer sequence number. |
-| `replaced` | empty | A newer stream attached for the same peer; this stream is done. The client treats it as permanent. |
-| `shutdown` | empty | The server is closing. The client reconnects with backoff. |
-| `: ping` (comment) | | Written every `KeepAlive` on an idle stream so proxies keep the connection and clients notice a dead one. |
-
-A client reconnecting sends `Last-Event-ID: <n>`; the server replays every
-signal for that peer with a higher sequence number that it still holds (up to
-`ReplayDepth` of them). Pipe drops duplicates by signal ID, so replaying too
-much is harmless and replaying too little is the only real loss.
-
-**`POST`** sends one signal; the body is the JSON envelope.
-
-| Status | Meaning | What the client does |
-| --- | --- | --- |
-| 202 | Queued for the recipient. | `Send` returns nil. |
-| 400 | Not a valid envelope, or `Last-Event-ID` was not a number. | `Send` returns an error with the server's message. |
-| 401 | No or bad credential. | `Send` returns `sse.ErrUnauthorized`; a stream gets `sse.ErrPermanent`. |
-| 403 | Credential does not match `X-Pipe-Peer`, or `from` is not the caller. | Same as 401. |
-| 404 | Recipient is not connected and not within its offline grace. | `Send` returns `pipe.ErrPeerUnavailable`; the dial fails fast. |
-| 413 | Body larger than `pipe.MaxEnvelopeSize` plus 4 KiB. | Error. Pipe never produces such envelopes. |
-| 503 | Recipient's queue is full, `MaxPeers` reached, or the server is shutting down. | `Send` returns an error; a stream reconnects with backoff. |
-
-## Server configuration
-
-| Field | Default | Protects against |
-| --- | --- | --- |
-| `Authenticator` | required | Anyone signaling as anyone. |
-| `QueueSize` | 256 | A peer that stops reading holding unbounded memory. Signals for it beyond this are refused with 503. A negotiation is a few dozen signals, so 256 covers several concurrent sessions per peer. |
-| `ReplayDepth` | 256 | Memory for reconnect replay. Delivered signals kept per peer for a client that reconnects with `Last-Event-ID`. |
-| `OfflineGrace` | 30s | Forgetting a peer that blinked. A peer with no stream keeps its queue this long, then is removed and senders get 404. Longer means slower "peer unavailable" errors; shorter means a laptop waking from sleep loses its queue. |
-| `KeepAlive` | 15s | Proxies and NATs dropping idle streams; clients not noticing a dead one. |
-| `MaxPeers` | 0 (unlimited) | Memory exhaustion from many registrations. New peers beyond the limit get 503. |
-| `Logger` | discard | Nothing. Tokens, SDP, and candidates are never logged at any level. |
-
-Memory per known peer is roughly `(QueueSize + ReplayDepth)` envelopes at
-worst, a few KiB each, plus one goroutine per attached stream. A single small
-process handles thousands of peers.
-
-## The client
-
-`sse.Client` implements `pipe.Signaler`:
+Every `sse.Client` field:
 
 ```go
 signaler := &sse.Client{
 	URL:   "https://signal.example.net/pipe",
 	Token: os.Getenv("PIPE_SIGNAL_TOKEN"),
+
+	// Optional. Timeout must stay zero: it would cut the event stream.
+	HTTPClient: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment}},
+	Backoff:    pipe.Backoff{Initial: time.Second, Maximum: 30 * time.Second, Factor: 2, Jitter: 0.2},
+	Inbox:      64,
+	Logger:     slog.Default(),
 }
-ep, err := pipe.New(ctx, pipe.Config{ID: "alice", Signaler: signaler})
 ```
 
-| Field | Default | Notes |
-| --- | --- | --- |
-| `URL` | required | Where the server is mounted. |
-| `Token` | | Sent as `Authorization: Bearer …` on every request. |
-| `Authorize` | | `func(r *http.Request, local pipe.PeerID)` called on every request after default headers. For credentials that are not one static token, or one client acting as several peers. |
-| `HTTPClient` | `http.DefaultClient` | Its `Timeout` must be zero; a timeout would cut the event stream. Contexts bound individual requests. |
-| `Backoff` | 500ms initial, 10s max, factor 2, jitter 0.2 | Reconnection spacing for the stream. |
-| `Inbox` | 64 | Signals received but not yet consumed by `Receive`. |
-| `Logger` | discard | Debug lines about reconnects; never the signal contents. |
-
-`Open` returns only after the server's `hello` confirms the identity, so a bad
-token, a wrong URL, or a token that belongs to another peer fails at
-`pipe.New` rather than at the first dial. Those failures wrap
-`sse.ErrPermanent` (and, for credentials, `sse.ErrUnauthorized`). Network
-errors and 5xx responses are transient: the stream goroutine reconnects with
-backoff forever until `Close`, replaying from its last event ID. When the
-stream fails permanently after `Open`, the endpoint's receive loop stops and
-every later `Dial` on that endpoint fails; rebuild the endpoint with a fixed
-configuration.
-
-One `Client` acting as several peers (a test, or one process hosting several
-identities) picks the credential per peer:
+One client for several peer IDs in one process, picking the token per peer:
 
 ```go
-tokens := map[pipe.PeerID]string{"alice": aliceToken, "bob": bobToken}
+// multipeer/main.go
+package main
 
-signaler := &sse.Client{
-	URL: "https://signal.example.net/pipe",
-	Authorize: func(r *http.Request, local pipe.PeerID) {
-		r.Header.Set("Authorization", "Bearer "+tokens[local])
-	},
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+
+	"ella.to/pipe"
+	"ella.to/pipe/signaling/sse"
+)
+
+func main() {
+	ctx := context.Background()
+	tokens := map[pipe.PeerID]string{
+		"alice": os.Getenv("ALICE_TOKEN"),
+		"bob":   os.Getenv("BOB_TOKEN"),
+	}
+
+	signaler := &sse.Client{
+		URL: "http://127.0.0.1:8080/pipe",
+		Authorize: func(r *http.Request, local pipe.PeerID) {
+			r.Header.Set("Authorization", "Bearer "+tokens[local])
+		},
+	}
+
+	for id := range tokens {
+		ep, err := pipe.New(ctx, pipe.Config{ID: id, Signaler: signaler})
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer ep.Close()
+		log.Printf("%s is online", id)
+	}
 }
 ```
 
-Two processes opening the same peer ID do not both stay attached. The newer
-stream replaces the older one, which receives `replaced` and reports
-`sse.ErrPermanent`. Give every device its own ID.
+Behavior worth knowing:
 
-## TLS and reverse proxies
+- `pipe.New` returns only after the server confirmed the identity, so a bad
+  token fails there with `sse.ErrPermanent` and `sse.ErrUnauthorized`.
+- Network errors and 5xx responses reconnect with backoff and replay missed
+  signals.
+- Opening the same peer ID twice: the newer stream wins and the older fails
+  permanently. Give every device its own ID.
 
-Terminate TLS in front of the server or hand it a certificate. Whichever proxy
-you use, it must not buffer the event stream and must not cut long-lived
-responses.
+## Step 6: behind a reverse proxy
+
+The proxy must not buffer responses and must not time out long-lived ones.
 
 Caddy:
 
@@ -349,40 +348,16 @@ location /pipe {
 	proxy_cache off;
 	proxy_read_timeout 1h;
 	proxy_send_timeout 1h;
-	chunked_transfer_encoding on;
 }
 ```
 
-The server sets `X-Accel-Buffering: no` and `Cache-Control: no-cache` on
-streams for proxies that honor them, and writes a keepalive comment every
-15 seconds so that idle streams do not look dead to a proxy with a shorter
-idle timeout. If your proxy has a hard maximum response duration (some cloud
-load balancers do), the client simply reconnects when it fires; nothing is
-lost within `ReplayDepth`, but set the maximum as high as you can.
+State lives in memory, so peers that talk to each other must reach the same
+instance. One instance handles thousands of peers; to run several, route by
+peer ID.
 
-Inside your own `http.Server`, never set `WriteTimeout`. The handler applies a
-10-second deadline to each individual write through `http.ResponseController`,
-which bounds a stalled client without bounding a healthy stream's lifetime.
+## Step 7: your own transport
 
-## Scaling and running more than one instance
-
-State lives in memory: per-peer queues, replay logs, and the attached stream.
-That is what makes the server small, and it means all peers that need to talk
-to each other must be on the same instance. For a personal project or a
-product with thousands of peers, one instance behind TLS is the right size.
-
-If you do run several, route by peer so that every peer of a group lands on
-the same instance (a consistent hash on the peer ID in the load balancer, or a
-separate hostname per group), and remember that `Server.Peers()` and
-`/healthz` are per instance. A shared backing store is not something this
-package tries to provide; a transport over NATS, Redis Streams, or a message
-broker is a better fit for that shape, and the next section is how to build
-one.
-
-## Writing your own Signaler
-
-Pipe owns the negotiation protocol; a transport only moves envelopes. Two
-interfaces:
+Implement `pipe.Signaler`, then run the conformance suite.
 
 ```go
 type Signaler interface {
@@ -390,96 +365,70 @@ type Signaler interface {
 }
 
 type SignalConn interface {
-	Send(ctx context.Context, msg Signal) error
-	Receive(ctx context.Context) (Signal, error)
-	Close() error
+	Send(ctx context.Context, msg Signal) error    // may run concurrently with Receive
+	Receive(ctx context.Context) (Signal, error)   // one caller at a time
+	Close() error                                  // idempotent; unblocks Send and Receive
 }
 ```
 
-The rules from `signaling.go` that the endpoint relies on:
-
-- `Receive` has exactly one caller at a time (the endpoint's receive loop).
-- `Send` may be called concurrently with `Receive`. The endpoint serializes
-  its own sends, so `Send` does not have to be safe against other `Send`s.
-- `Send` and `Receive` honor their contexts.
-- `Close` is idempotent and unblocks both `Send` and `Receive`.
-- Delivery is at-least-once, ordered when practical. Duplicates and
-  reordering are tolerated; silent loss is what breaks dials.
-- Implementations may reconnect internally.
-- Report a missing recipient by wrapping `pipe.ErrPeerUnavailable`, and a
-  peer ID already registered by wrapping `pipe.ErrDuplicatePeer`, when the
-  transport can know those things.
-
-The envelope must survive the trip byte for byte in meaning: encode with
-`encoding/json` and do not rewrite fields. A transport that can, should also
-refuse a signal whose `From` is not the authenticated sender, as the HTTP
-server does; that is what turns peer IDs into identities.
-
-Run the conformance suite against your transport. It checks every rule above
-and opts into the two transport-dependent behaviors through `Config`:
+Rules: honor contexts, deliver at least once (duplicates and reordering are
+fine, silent loss is not), move the JSON envelope unmodified, and wrap
+`pipe.ErrPeerUnavailable` / `pipe.ErrDuplicatePeer` when the transport can tell.
 
 ```go
+// mytransport/conformance_test.go
 package mytransport_test
 
 import (
 	"testing"
 
 	"ella.to/pipe"
+	"ella.to/pipe/signaling/memory"
 	"ella.to/pipe/signaling/signalertest"
-
-	"example.com/mytransport"
 )
 
 func TestConformance(t *testing.T) {
 	signalertest.Run(t, signalertest.Config{
-		// Called once per subtest. Start a broker here and register its
-		// shutdown with t.Cleanup.
+		// Replace memory.New() with your transport. Called once per subtest.
 		NewSignaler: func(t *testing.T) pipe.Signaler {
-			return mytransport.Start(t)
+			return memory.New()
 		},
-		// Set to true if Open fails with pipe.ErrDuplicatePeer for a peer ID
-		// that is already live.
-		RejectsDuplicatePeers: true,
-		// Set to true if Send fails with pipe.ErrPeerUnavailable for a peer
-		// that has no live connection.
-		ReportsUnavailablePeer: true,
-		// Largest payload the suite round-trips; defaults to pipe.MaxSDPSize.
-		MaxPayload: 0,
+		RejectsDuplicatePeers:  true, // Open fails with pipe.ErrDuplicatePeer for a live ID
+		ReportsUnavailablePeer: true, // Send fails with pipe.ErrPeerUnavailable for an absent peer
 	})
 }
 ```
 
-`signalertest.Offer`, `signalertest.Answer`, and `signalertest.Signal` build
-valid envelopes for your own tests. The HTTP transport's own conformance test
-is in `signaling/sse/sse_test.go` and is a good template: it starts an
-`httptest.Server` per subtest and passes `ReportsUnavailablePeer: true`.
+```sh
+go test ./mytransport
+```
 
-### The memory hub
-
-`signaling/memory` is the in-process transport used by the tests and the
-single-binary examples. Both peers must share the same `*memory.Hub`. It can
-inject faults deterministically, which is how pipe's own tolerance for
-imperfect transports is tested and how you can test yours:
+For your own tests, `signaling/memory` injects faults:
 
 ```go
 hub := memory.New(
 	memory.WithQueueSize(128),
-	memory.WithFault(memory.DuplicateAll()),      // every signal twice
+	memory.WithFault(memory.DuplicateAll()), // or DropKind, DropFirst, SwapAdjacent
 )
-// other faults:
-//   memory.DropKind(pipe.KindICEComplete)        drop a kind entirely
-//   memory.DropFirst(pipe.KindCandidate, 2)      drop the first n of a kind
-//   memory.SwapAdjacent(pipe.KindCandidate)      reorder pairs
-
-hub.Disconnect("alice")   // as if alice's transport failed
-hub.Registered()          // live peer IDs
+hub.Disconnect("alice") // as if alice's transport failed
 ```
 
-A `Fault` is any `func(pipe.Signal) []pipe.Signal`: return nothing to drop,
-several copies to duplicate, or hold and release later to reorder.
+## Reference: HTTP protocol
 
-## Related
+`GET <url>` opens the stream. Events: `hello` (the authenticated peer ID),
+`signal` (a JSON `pipe.Signal`, with an `id:` sequence number), `replaced`,
+`shutdown`, and `: ping` comments. Reconnects send `Last-Event-ID`.
 
-- Hardening the whole deployment: [06-security.md](06-security.md)
-- Running it in Docker with TLS in front: [08-docker.md](08-docker.md)
-- The envelope format and validation limits: [11-protocol.md](11-protocol.md)
+`POST <url>` with a JSON `pipe.Signal` body:
+
+| Status | Meaning |
+| --- | --- |
+| 202 | Queued |
+| 400 | Invalid envelope |
+| 401 | Missing or bad credential (`sse.ErrUnauthorized`) |
+| 403 | Credential does not match `X-Pipe-Peer`, or `from` is not the caller |
+| 404 | Recipient unknown (`pipe.ErrPeerUnavailable`) |
+| 413 | Body larger than `pipe.MaxEnvelopeSize` plus 4 KiB |
+| 503 | Recipient queue full, `MaxPeers` reached, or shutting down |
+
+The envelope itself is in [11-protocol.md](11-protocol.md).

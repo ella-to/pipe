@@ -1,10 +1,14 @@
-// Package turnx runs a self-contained STUN and TURN server for the examples,
-// with per-user throughput plans on the relayed path.
+// Package relay runs a STUN and TURN server for pipe peers, with per-user
+// throughput plans on the relayed path.
 //
 // One UDP listener serves both roles: it answers STUN Binding requests, and it
-// answers TURN Allocate requests for authenticated users. That is what a real
-// deployment looks like, and it means an example needs one address rather than
-// two. An optional TCP listener serves clients whose networks block UDP.
+// answers TURN Allocate requests for authenticated users. An optional TCP
+// listener serves clients whose networks block UDP.
+//
+//	srv, err := relay.Start(relay.Config{
+//		Listen: "127.0.0.1:3478",
+//		Users:  map[string]relay.User{"admin": {Password: "admin"}},
+//	})
 //
 // Users are authenticated either from a static table ([Config.Users]) or with
 // ephemeral credentials derived from a shared secret ([Config.AuthSecret]),
@@ -16,7 +20,7 @@
 // The throughput budget is real congestion, not a reported number: packets are
 // delayed or dropped, so SCTP inside a pipe connection backs off the way it
 // would on a slow link.
-package turnx
+package relay
 
 import (
 	"errors"
@@ -230,7 +234,7 @@ func Start(cfg Config) (*Server, error) {
 		cfg.Listen = "127.0.0.1:0"
 	}
 	if (cfg.MinPort == 0) != (cfg.MaxPort == 0) || cfg.MinPort > cfg.MaxPort {
-		return nil, errors.New("turnx: MinPort and MaxPort must both be set, with MinPort <= MaxPort")
+		return nil, errors.New("relay: MinPort and MaxPort must both be set, with MinPort <= MaxPort")
 	}
 	log := cfg.Logger
 	if log == nil {
@@ -238,16 +242,16 @@ func Start(cfg Config) (*Server, error) {
 	}
 	for name := range cfg.Plans {
 		if name == "" {
-			return nil, errors.New("turnx: a plan name cannot be empty")
+			return nil, errors.New("relay: a plan name cannot be empty")
 		}
 	}
 	for user, u := range cfg.Users {
 		if user == "" {
-			return nil, errors.New("turnx: a TURN username cannot be empty")
+			return nil, errors.New("relay: a TURN username cannot be empty")
 		}
 		if u.Plan != "" {
 			if _, ok := cfg.Plans[u.Plan]; !ok {
-				return nil, fmt.Errorf("turnx: user %q refers to unknown plan %q", user, u.Plan)
+				return nil, fmt.Errorf("relay: user %q refers to unknown plan %q", user, u.Plan)
 			}
 		}
 	}
@@ -264,12 +268,12 @@ func Start(cfg Config) (*Server, error) {
 
 	conn, err := net.ListenPacket("udp4", cfg.Listen)
 	if err != nil {
-		return nil, fmt.Errorf("turnx: listen on %s: %w", cfg.Listen, err)
+		return nil, fmt.Errorf("relay: listen on %s: %w", cfg.Listen, err)
 	}
 	addr, ok := conn.LocalAddr().(*net.UDPAddr)
 	if !ok {
 		_ = conn.Close()
-		return nil, fmt.Errorf("turnx: listener reported a %T address", conn.LocalAddr())
+		return nil, fmt.Errorf("relay: listener reported a %T address", conn.LocalAddr())
 	}
 
 	relayIP := cfg.RelayIP
@@ -278,7 +282,7 @@ func Start(cfg Config) (*Server, error) {
 	}
 	if relayIP.IsUnspecified() {
 		_ = conn.Close()
-		return nil, errors.New("turnx: listening on a wildcard address requires an explicit RelayIP")
+		return nil, errors.New("relay: listening on a wildcard address requires an explicit RelayIP")
 	}
 
 	// Relay sockets bind to the same interface the server listens on, except
@@ -312,7 +316,7 @@ func Start(cfg Config) (*Server, error) {
 		tcpListener, err = net.Listen("tcp4", cfg.ListenTCP)
 		if err != nil {
 			_ = conn.Close()
-			return nil, fmt.Errorf("turnx: listen on tcp %s: %w", cfg.ListenTCP, err)
+			return nil, fmt.Errorf("relay: listen on tcp %s: %w", cfg.ListenTCP, err)
 		}
 		listenerConfigs = []turn.ListenerConfig{{Listener: tcpListener, RelayAddressGenerator: gen}}
 	}
@@ -348,7 +352,7 @@ func Start(cfg Config) (*Server, error) {
 		if tcpListener != nil {
 			_ = tcpListener.Close()
 		}
-		return nil, fmt.Errorf("turnx: start the TURN server: %w", err)
+		return nil, fmt.Errorf("relay: start the TURN server: %w", err)
 	}
 
 	s := &Server{cfg: cfg, srv: srv, addr: addr, gen: gen, log: log}
@@ -409,10 +413,10 @@ func (s *Server) IssueCredentials(userID string, ttl time.Duration) (username, p
 // example "alice@paid", and [Config.PlanFor]'s default maps it.
 func IssueCredentials(secret, userID string, ttl time.Duration) (username, password string, err error) {
 	if secret == "" {
-		return "", "", errors.New("turnx: an auth secret is required to issue credentials")
+		return "", "", errors.New("relay: an auth secret is required to issue credentials")
 	}
 	if userID == "" || strings.Contains(userID, ":") {
-		return "", "", errors.New("turnx: the user ID must be non-empty and must not contain ':'")
+		return "", "", errors.New("relay: the user ID must be non-empty and must not contain ':'")
 	}
 	if ttl <= 0 {
 		ttl = DefaultCredentialTTL
@@ -428,7 +432,7 @@ func (s *Server) Close() error {
 	err := s.srv.Close()
 	// turn.Server.Close closes the listeners it was given.
 	if err != nil && !errors.Is(err, net.ErrClosed) {
-		return fmt.Errorf("turnx: close: %w", err)
+		return fmt.Errorf("relay: close: %w", err)
 	}
 	return nil
 }
@@ -788,11 +792,11 @@ func ParseUsers(spec string) (map[string]User, error) {
 		}
 		user, rest, ok := strings.Cut(entry, "=")
 		if !ok || user == "" || rest == "" {
-			return nil, fmt.Errorf("turnx: %q is not a user=password[:plan] entry", entry)
+			return nil, fmt.Errorf("relay: %q is not a user=password[:plan] entry", entry)
 		}
 		password, plan, _ := strings.Cut(rest, ":")
 		if password == "" {
-			return nil, fmt.Errorf("turnx: %q has an empty password", entry)
+			return nil, fmt.Errorf("relay: %q has an empty password", entry)
 		}
 		users[user] = User{Password: password, Plan: plan}
 	}
@@ -810,18 +814,18 @@ func ParsePlans(spec string) (map[string]Plan, error) {
 		}
 		name, rest, ok := strings.Cut(entry, "=")
 		if !ok || name == "" || rest == "" {
-			return nil, fmt.Errorf("turnx: %q is not a name=rate[/maxallocations] entry", entry)
+			return nil, fmt.Errorf("relay: %q is not a name=rate[/maxallocations] entry", entry)
 		}
 		rateSpec, allocSpec, hasAlloc := strings.Cut(rest, "/")
 		r, err := ParseSize(rateSpec)
 		if err != nil {
-			return nil, fmt.Errorf("turnx: plan %q: %w", name, err)
+			return nil, fmt.Errorf("relay: plan %q: %w", name, err)
 		}
 		p := Plan{Rate: r}
 		if hasAlloc {
 			n, err := strconv.Atoi(strings.TrimSpace(allocSpec))
 			if err != nil || n < 0 {
-				return nil, fmt.Errorf("turnx: plan %q: %q is not an allocation count", name, allocSpec)
+				return nil, fmt.Errorf("relay: plan %q: %q is not an allocation count", name, allocSpec)
 			}
 			p.MaxAllocations = n
 		}
@@ -835,7 +839,7 @@ func ParsePlans(spec string) (map[string]Plan, error) {
 func ParseSize(s string) (int64, error) {
 	text := strings.TrimSpace(s)
 	if text == "" {
-		return 0, errors.New("turnx: an empty size")
+		return 0, errors.New("relay: an empty size")
 	}
 
 	multipliers := []struct {
@@ -865,10 +869,10 @@ func ParseSize(s string) (int64, error) {
 
 	value, err := strconv.ParseFloat(text, 64)
 	if err != nil {
-		return 0, fmt.Errorf("turnx: %q is not a size: %w", s, err)
+		return 0, fmt.Errorf("relay: %q is not a size: %w", s, err)
 	}
 	if value < 0 {
-		return 0, fmt.Errorf("turnx: %q is negative", s)
+		return 0, fmt.Errorf("relay: %q is negative", s)
 	}
 	return int64(value * float64(factor)), nil
 }
@@ -882,15 +886,15 @@ func ParsePortRange(spec string) (minPort, maxPort uint16, err error) {
 	}
 	lo, hi, ok := strings.Cut(spec, "-")
 	if !ok {
-		return 0, 0, fmt.Errorf("turnx: %q is not a min-max port range", spec)
+		return 0, 0, fmt.Errorf("relay: %q is not a min-max port range", spec)
 	}
 	a, err := strconv.ParseUint(strings.TrimSpace(lo), 10, 16)
 	if err != nil || a == 0 {
-		return 0, 0, fmt.Errorf("turnx: %q is not a valid port", lo)
+		return 0, 0, fmt.Errorf("relay: %q is not a valid port", lo)
 	}
 	b, err := strconv.ParseUint(strings.TrimSpace(hi), 10, 16)
 	if err != nil || b == 0 || b < a {
-		return 0, 0, fmt.Errorf("turnx: %q is not a valid upper port", hi)
+		return 0, 0, fmt.Errorf("relay: %q is not a valid upper port", hi)
 	}
 	return uint16(a), uint16(b), nil
 }

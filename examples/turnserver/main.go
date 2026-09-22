@@ -45,13 +45,13 @@ import (
 	"strings"
 	"time"
 
-	"ella.to/pipe/examples/internal/turnx"
+	"ella.to/pipe/relay"
 )
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:3478", "UDP address to serve STUN and TURN on")
 	listenTCP := flag.String("listen-tcp", "", "optional TCP address to serve TURN on as well")
-	realm := flag.String("realm", turnx.DefaultRealm, "TURN realm")
+	realm := flag.String("realm", relay.DefaultRealm, "TURN realm")
 	users := flag.String("users", "admin=admin",
 		"comma-separated user=password[:plan] list (or set PIPE_TURN_USERS)")
 	secret := flag.String("auth-secret", "",
@@ -65,7 +65,7 @@ func main() {
 	rateSpec := flag.String("rate", "0",
 		"default plan: throughput budget per relay socket per direction, e.g. 512KiB; 0 is unlimited")
 	burstSpec := flag.String("burst", "0", "default plan: token bucket depth; 0 derives it from -rate")
-	maxDelay := flag.Duration("max-delay", turnx.DefaultMaxDelay,
+	maxDelay := flag.Duration("max-delay", relay.DefaultMaxDelay,
 		"how long a relayed packet may be held for budget before it is dropped")
 	maxAllocs := flag.Int("max-allocations", 0,
 		"default plan: concurrent relay sockets per user; 0 is unlimited")
@@ -118,26 +118,26 @@ func run(cfg config) error {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	users, err := turnx.ParseUsers(cfg.users)
+	users, err := relay.ParseUsers(cfg.users)
 	if err != nil {
 		return err
 	}
 	if len(users) == 0 && cfg.secret == "" {
 		return errors.New("configure -users or -auth-secret; a relay with neither refuses everyone")
 	}
-	plans, err := turnx.ParsePlans(cfg.plans)
+	plans, err := relay.ParsePlans(cfg.plans)
 	if err != nil {
 		return err
 	}
-	rateBytes, err := turnx.ParseSize(cfg.rateSpec)
+	rateBytes, err := relay.ParseSize(cfg.rateSpec)
 	if err != nil {
 		return err
 	}
-	burst, err := turnx.ParseSize(cfg.burstSpec)
+	burst, err := relay.ParseSize(cfg.burstSpec)
 	if err != nil {
 		return err
 	}
-	minPort, maxPort, err := turnx.ParsePortRange(cfg.relayPorts)
+	minPort, maxPort, err := relay.ParsePortRange(cfg.relayPorts)
 	if err != nil {
 		return err
 	}
@@ -149,14 +149,14 @@ func run(cfg config) error {
 		}
 	}
 
-	srv, err := turnx.Start(turnx.Config{
+	srv, err := relay.Start(relay.Config{
 		Listen:     cfg.listen,
 		ListenTCP:  cfg.listenTCP,
 		Realm:      cfg.realm,
 		Users:      users,
 		AuthSecret: cfg.secret,
 		Plans:      plans,
-		DefaultPlan: turnx.Plan{
+		DefaultPlan: relay.Plan{
 			Rate:           rateBytes,
 			Burst:          burst,
 			MaxDelay:       cfg.maxDelay,
@@ -218,16 +218,16 @@ func run(cfg config) error {
 	return nil
 }
 
-func logStats(log *slog.Logger, s turnx.Stats) {
+func logStats(log *slog.Logger, s relay.Stats) {
 	log.Info("turn: traffic", "stats", s.String())
-	for _, id := range turnx.SortedUsers(s) {
+	for _, id := range relay.SortedUsers(s) {
 		log.Info("turn: user", "user", id, "stats", s.Users[id].String())
 	}
 }
 
 // names returns the configured usernames in a stable order. Passwords are never
 // printed.
-func names(users map[string]turnx.User) []string {
+func names(users map[string]relay.User) []string {
 	out := make([]string, 0, len(users))
 	for user := range users {
 		out = append(out, user)
@@ -236,7 +236,7 @@ func names(users map[string]turnx.User) []string {
 	return out
 }
 
-func planNames(plans map[string]turnx.Plan) []string {
+func planNames(plans map[string]relay.Plan) []string {
 	out := make([]string, 0, len(plans))
 	for name := range plans {
 		out = append(out, name)
@@ -245,7 +245,7 @@ func planNames(plans map[string]turnx.Plan) []string {
 	return out
 }
 
-func firstName(users map[string]turnx.User) string {
+func firstName(users map[string]relay.User) string {
 	if all := names(users); len(all) > 0 {
 		return all[0]
 	}
