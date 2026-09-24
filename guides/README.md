@@ -33,6 +33,7 @@ go get ella.to/pipe@latest
 | [09 Client API](09-client-api.md) | `Endpoint`, `Conn`, errors, deadlines, HTTP over pipe, metrics |
 | [10 Operations](10-operations.md) | Metrics, logs, tuning, troubleshooting |
 | [11 Protocol](11-protocol.md) | Signaling envelope and stream frames, for other implementations |
+| [12 Multiplexing](12-multiplexing.md) | Many local peer IDs over one signaling stream with `sse.Mux` |
 
 ## Packages
 

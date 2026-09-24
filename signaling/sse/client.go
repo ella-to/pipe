@@ -189,12 +189,23 @@ func (c *conn) Send(ctx context.Context, msg pipe.Signal) error {
 	if err := c.checkOpen(); err != nil {
 		return err
 	}
+	err := postSignal(ctx, c.http, c.client.URL, msg, c.decorate)
+	if err != nil && !errors.Is(err, pipe.ErrPeerUnavailable) && !errors.Is(err, ErrUnauthorized) {
+		if cerr := c.checkOpen(); cerr != nil {
+			return cerr
+		}
+	}
+	return err
+}
+
+// postSignal sends one signal with a POST request that decorate authenticates.
+func postSignal(ctx context.Context, hc *http.Client, url string, msg pipe.Signal, decorate func(*http.Request)) error {
 	body, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("sse: encode signal: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.client.URL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("sse: build request: %w", err)
 	}
@@ -204,13 +215,10 @@ func (c *conn) Send(ctx context.Context, msg pipe.Signal) error {
 	// keep-alive connection turns out to have been closed by the server or a
 	// proxy, which would otherwise surface as an EOF.
 	req.Header.Set("Idempotency-Key", msg.ID)
-	c.decorate(req)
+	decorate(req)
 
-	resp, err := c.http.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
-		if cerr := c.checkOpen(); cerr != nil {
-			return cerr
-		}
 		return fmt.Errorf("sse: send %s: %w", msg.Kind, err)
 	}
 	defer resp.Body.Close()
@@ -304,12 +312,17 @@ func (c *conn) setTerminal(err error) {
 
 // decorate applies identity headers to a request.
 func (c *conn) decorate(req *http.Request) {
-	req.Header.Set(PeerHeader, string(c.local))
-	if c.client.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.client.Token)
+	c.client.decorate(req, c.local)
+}
+
+// decorate applies the identity headers for local to a request.
+func (c *Client) decorate(req *http.Request, local pipe.PeerID) {
+	req.Header.Set(PeerHeader, string(local))
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
-	if c.client.Authorize != nil {
-		c.client.Authorize(req, c.local)
+	if c.Authorize != nil {
+		c.Authorize(req, local)
 	}
 }
 
@@ -413,6 +426,10 @@ func (c *conn) classify(err error) error {
 	if c.ctx.Err() != nil {
 		return nil
 	}
+	return classifyStream(err, c.client.URL)
+}
+
+func classifyStream(err error, url string) error {
 	var status *sse.StatusError
 	if !errors.As(err, &status) {
 		return fmt.Errorf("sse: stream: %w", err)
@@ -422,7 +439,7 @@ func (c *conn) classify(err error) error {
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return fmt.Errorf("%w: %s: %w", ErrPermanent, text, ErrUnauthorized)
 	case http.StatusNotFound, http.StatusMethodNotAllowed:
-		return fmt.Errorf("%w: %s is not a pipe signaling server (%s)", ErrPermanent, c.client.URL, text)
+		return fmt.Errorf("%w: %s is not a pipe signaling server (%s)", ErrPermanent, url, text)
 	default:
 		return fmt.Errorf("sse: stream: %s", text)
 	}

@@ -57,6 +57,8 @@ const (
 	eventShutdown = "shutdown"
 )
 
+var errServerClosing = errors.New("signaling server is shutting down")
+
 // Config configures a [Server]. Only Authenticator is required.
 type Config struct {
 	// Authenticator establishes the identity behind every request.
@@ -94,6 +96,7 @@ type Server struct {
 
 	mu     sync.Mutex
 	peers  map[pipe.PeerID]*peer
+	muxes  map[string]*muxStream
 	closed bool
 }
 
@@ -127,6 +130,7 @@ func NewServer(cfg Config) (*Server, error) {
 		cfg:   cfg,
 		log:   cfg.Logger,
 		peers: make(map[pipe.PeerID]*peer),
+		muxes: make(map[string]*muxStream),
 	}, nil
 }
 
@@ -153,10 +157,18 @@ func (s *Server) Close() error {
 		peers = append(peers, p)
 	}
 	s.peers = make(map[pipe.PeerID]*peer)
+	muxes := make([]*muxStream, 0, len(s.muxes))
+	for _, m := range s.muxes {
+		muxes = append(muxes, m)
+	}
+	s.muxes = make(map[string]*muxStream)
 	s.mu.Unlock()
 
 	for _, p := range peers {
 		p.shutdown()
+	}
+	for _, m := range muxes {
+		m.shutdown()
 	}
 	return nil
 }
@@ -184,11 +196,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
+		if r.Header.Get(MuxHeader) != "" {
+			s.serveMuxStream(w, r, id)
+			return
+		}
 		s.serveStream(w, r, id)
 	case http.MethodPost:
 		s.serveSend(w, r, id)
+	case http.MethodPut:
+		s.serveJoin(w, r, id)
+	case http.MethodDelete:
+		s.serveLeave(w, r, id)
 	default:
-		w.Header().Set("Allow", "GET, POST")
+		w.Header().Set("Allow", "GET, POST, PUT, DELETE")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
@@ -259,6 +279,62 @@ func (s *Server) serveStream(w http.ResponseWriter, r *http.Request, id pipe.Pee
 		lastID = n
 	}
 
+	push, ok := openPusher(w)
+	if !ok {
+		return
+	}
+
+	done := make(chan struct{})
+	var reason string
+	att := &attachment{
+		wake: make(chan struct{}, 1),
+		end: func(r string) {
+			reason = r
+			close(done)
+		},
+	}
+	p.attach(att, lastID)
+	defer p.detach(att)
+
+	// Tell the client who it is, so that a misconfigured one fails loudly.
+	if err := push(&sse.Message{Event: eventHello, Data: strconv.Quote(string(id))}); err != nil {
+		return
+	}
+	s.log.Debug("sse: stream attached", slog.String("peer", string(id)),
+		slog.Uint64("last_event_id", lastID))
+
+	ticker := time.NewTicker(s.cfg.KeepAlive)
+	defer ticker.Stop()
+
+	for {
+		for _, e := range p.takeUnsent(att) {
+			msg := &sse.Message{Id: strconv.FormatUint(e.id, 10), Event: eventSignal, Data: string(e.data)}
+			if err := push(msg); err != nil {
+				s.log.Debug("sse: stream write failed", slog.String("peer", string(id)),
+					slog.String("error", err.Error()))
+				return
+			}
+		}
+
+		select {
+		case <-att.wake:
+		case <-ticker.C:
+			if err := push(sse.NewComment("ping")); err != nil {
+				return
+			}
+		case <-done:
+			// Replaced by a newer stream, or the server is shutting down.
+			_ = push(&sse.Message{Event: reason})
+			return
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// openPusher prepares w for an event stream. On failure it has already written
+// the error response.
+func openPusher(w http.ResponseWriter) (func(*sse.Message) error, bool) {
 	rc := http.NewResponseController(w)
 	// A server with WriteTimeout set would otherwise cut the stream; a
 	// per-write deadline keeps stalled clients from pinning the goroutine
@@ -274,59 +350,21 @@ func (s *Server) serveStream(w http.ResponseWriter, r *http.Request, id pipe.Pee
 	}
 	if err := arm(); err != nil {
 		http.Error(w, "streaming is not supported", http.StatusInternalServerError)
-		return
+		return nil, false
 	}
 
 	w.Header().Set("X-Accel-Buffering", "no")
 	pusher, err := sse.CreateHttpPusher(w)
 	if err != nil {
 		http.Error(w, "streaming is not supported", http.StatusInternalServerError)
-		return
+		return nil, false
 	}
-	push := func(msg *sse.Message) error {
+	return func(msg *sse.Message) error {
 		if err := arm(); err != nil {
 			return err
 		}
 		return pusher.Push(msg)
-	}
-
-	att := p.attach(lastID)
-	defer p.detach(att)
-
-	// Tell the client who it is, so that a misconfigured one fails loudly.
-	if err := push(&sse.Message{Event: eventHello, Data: strconv.Quote(string(id))}); err != nil {
-		return
-	}
-	s.log.Debug("sse: stream attached", slog.String("peer", string(id)),
-		slog.Uint64("last_event_id", lastID))
-
-	ticker := time.NewTicker(s.cfg.KeepAlive)
-	defer ticker.Stop()
-
-	for {
-		for _, e := range p.takeUnsent() {
-			msg := &sse.Message{Id: strconv.FormatUint(e.id, 10), Event: eventSignal, Data: string(e.data)}
-			if err := push(msg); err != nil {
-				s.log.Debug("sse: stream write failed", slog.String("peer", string(id)),
-					slog.String("error", err.Error()))
-				return
-			}
-		}
-
-		select {
-		case <-p.notify:
-		case <-ticker.C:
-			if err := push(sse.NewComment("ping")); err != nil {
-				return
-			}
-		case <-att.done:
-			// Replaced by a newer stream, or the server is shutting down.
-			_ = push(&sse.Message{Event: att.reason})
-			return
-		case <-r.Context().Done():
-			return
-		}
-	}
+	}, true
 }
 
 // admit returns the peer record for id, creating it within the configured
@@ -336,7 +374,7 @@ func (s *Server) admit(id pipe.PeerID) (*peer, error) {
 	defer s.mu.Unlock()
 
 	if s.closed {
-		return nil, errors.New("signaling server is shutting down")
+		return nil, errServerClosing
 	}
 	if p, ok := s.peers[id]; ok {
 		return p, nil
@@ -379,26 +417,29 @@ type entry struct {
 	data []byte
 }
 
-// attachment identifies one stream so that a newer stream can replace it.
+// attachment identifies the stream a peer is delivered on, so that a newer
+// stream can replace it. A multiplexed stream gives each of its peers its own
+// attachment sharing one wake channel.
 type attachment struct {
-	done chan struct{}
-	// reason names the event sent to the client when done is closed. It is
-	// written under the peer mutex before done is closed.
-	reason string
+	// wake is signaled, without blocking, when the peer has new entries.
+	wake chan struct{}
+	// end is called once, with the peer mutex held, when a newer stream
+	// replaces this one or the server shuts down. It names the event to send
+	// and must not block or take the peer mutex.
+	end func(reason string)
 }
 
-func (a *attachment) end(reason string) {
-	a.reason = reason
-	close(a.done)
+func (a *attachment) poke() {
+	select {
+	case a.wake <- struct{}{}:
+	default:
+	}
 }
 
 // peer holds one peer's queue, replay log, and current stream.
 type peer struct {
 	srv *Server
 	id  pipe.PeerID
-
-	// notify wakes the stream when new entries are queued.
-	notify chan struct{}
 
 	mu sync.Mutex
 	// seq is the last sequence number assigned.
@@ -417,7 +458,7 @@ type peer struct {
 }
 
 func newPeer(s *Server, id pipe.PeerID) *peer {
-	p := &peer{srv: s, id: id, notify: make(chan struct{}, 1)}
+	p := &peer{srv: s, id: id}
 	p.reaper = time.AfterFunc(s.cfg.OfflineGrace, p.expire)
 	return p
 }
@@ -435,21 +476,19 @@ func (p *peer) enqueue(data []byte) bool {
 	}
 	p.seq++
 	p.log = append(p.log, entry{id: p.seq, data: data})
+	stream := p.stream
 	p.mu.Unlock()
 
-	select {
-	case p.notify <- struct{}{}:
-	default:
+	if stream != nil {
+		stream.poke()
 	}
 	return true
 }
 
-// attach registers a new stream, replacing any current one, and rewinds the
-// delivery cursor to lastID so that the new stream receives what the old one
-// may have lost.
-func (p *peer) attach(lastID uint64) *attachment {
-	att := &attachment{done: make(chan struct{})}
-
+// attach registers att as the peer's stream, replacing any current one, and
+// rewinds the delivery cursor to lastID so that the new stream receives what
+// the old one may have lost.
+func (p *peer) attach(att *attachment, lastID uint64) {
 	p.mu.Lock()
 	if p.stream != nil {
 		p.stream.end(eventReplaced)
@@ -469,11 +508,7 @@ func (p *peer) attach(lastID uint64) *attachment {
 	}
 	p.mu.Unlock()
 
-	select {
-	case p.notify <- struct{}{}:
-	default:
-	}
-	return att
+	att.poke()
 }
 
 // detach clears the stream if att is still current and starts the offline
@@ -491,10 +526,15 @@ func (p *peer) detach(att *attachment) {
 }
 
 // takeUnsent returns the entries not yet written to a stream, marks them sent,
-// and trims delivered entries beyond the replay depth.
-func (p *peer) takeUnsent() []entry {
+// and trims delivered entries beyond the replay depth. It returns nothing when
+// att is no longer the peer's stream, so that a replaced stream cannot take
+// entries meant for its successor.
+func (p *peer) takeUnsent(att *attachment) []entry {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.stream != att {
+		return nil
+	}
 
 	start := len(p.log)
 	for i := range p.log {

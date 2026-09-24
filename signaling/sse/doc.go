@@ -22,6 +22,14 @@
 //     caller, 400 when the envelope is invalid, and 503 when the recipient's
 //     queue is full.
 //
+// A [Mux] carries many peers over one stream. It opens the stream with a GET
+// carrying [MuxHeader] and learns the stream ID from the first event, named
+// "mux". Each peer then joins with a PUT carrying the stream ID in [MuxHeader]
+// and its own credential, and leaves with a DELETE. Signals for every member
+// arrive on the shared stream as "signal" events whose "id" is that peer's
+// sequence number; a "detached" event reports a member taken over by another
+// stream. Sending is the same POST.
+//
 // The server never reads signal payloads. SDP and ICE candidates pass through
 // as opaque JSON.
 //

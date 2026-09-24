@@ -82,6 +82,10 @@ ep, err := pipe.New(ctx, pipe.Config{
 })
 ```
 
+A process that hosts many peer IDs can share one signaling stream among all of
+them by using `&sse.Mux{...}` (same fields) instead. See
+[Multiplexing](guides/12-multiplexing.md).
+
 The [guides](guides/README.md) walk through all of it: concepts, a quickstart,
 the signaling server, STUN, running and securing your own TURN relay, giving
 free and paying users different relay budgets, Docker, the Go API, operations,

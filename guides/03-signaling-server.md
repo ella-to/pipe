@@ -317,6 +317,9 @@ Behavior worth knowing:
   signals.
 - Opening the same peer ID twice: the newer stream wins and the older fails
   permanently. Give every device its own ID.
+- A shared `sse.Client` still opens one stream per peer ID. For many peer IDs
+  in one process, use `sse.Mux`, which has the same fields and carries all of
+  them over one stream. See [12 Multiplexing](12-multiplexing.md).
 
 ## Step 6: behind a reverse proxy
 
